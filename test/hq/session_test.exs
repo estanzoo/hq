@@ -148,4 +148,67 @@ defmodule Hq.SessionTest do
       end
     end)
   end
+
+  test "coalesces a burst into ONE prompt, not one per message", %{fake: fake} do
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "one")
+    Hq.Session.deliver("worker-b", "worker-c", "two")
+    Hq.Session.deliver("worker-b", "worker-a", "three")
+
+    stub_status(fake, "idle")
+
+    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+      "pane_id" => @pane,
+      "agent_status" => "idle"
+    })
+
+    assert eventually(fn -> length(prompts(fake)) == 1 end)
+    Process.sleep(60)
+    assert length(prompts(fake)) == 1
+
+    [%{"params" => %{"text" => text}}] = prompts(fake)
+    assert text =~ "[hq] 3 messages"
+    assert text =~ "from worker-a:\none"
+    assert text =~ "from worker-c:\ntwo"
+  end
+
+  test "a status flap does not cause a double delivery", %{fake: fake} do
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "once only")
+    stub_status(fake, "idle")
+
+    for _ <- 1..5 do
+      FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+        "pane_id" => @pane,
+        "agent_status" => "idle"
+      })
+    end
+
+    assert eventually(fn -> length(prompts(fake)) == 1 end)
+    Process.sleep(60)
+    assert length(prompts(fake)) == 1
+  end
+
+  test "re-reads status after settling and does NOT deliver if the agent resumed", %{fake: fake} do
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "should stay held")
+
+    # Announce idle, but the authoritative read still says working — the flap
+    # case this window exists to catch.
+    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+      "pane_id" => @pane,
+      "agent_status" => "idle"
+    })
+
+    Process.sleep(120)
+
+    assert prompts(fake) == []
+    assert Hq.Session.info("worker-b")["mailbox"] == 1
+  end
 end

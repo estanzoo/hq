@@ -111,11 +111,33 @@ defmodule Hq.Session do
   end
 
   def handle_info({:hq_events, :disconnected}, state), do: {:noreply, state}
+
+  def handle_info(:settled, state) do
+    state = %{state | settling: false} |> refresh_status()
+    {:noreply, flush(state)}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   # -- Internals ------------------------------------------------------------
 
-  defp maybe_flush(state), do: flush(state)
+  # Status flaps: an agent can report idle between two phases of one turn.
+  # Waiting out a short window and then re-reading the authoritative status
+  # keeps hq from typing into a session that is about to resume. The window
+  # also batches a burst of messages into a single prompt, so three arrivals
+  # start one turn instead of three.
+  defp maybe_flush(%{settling: true} = state), do: state
+
+  defp maybe_flush(state) do
+    if ready?(state) do
+      Process.send_after(self(), :settled, settle_ms())
+      %{state | settling: true}
+    else
+      state
+    end
+  end
+
+  defp settle_ms, do: Application.get_env(:hq, :settle_ms, 400)
 
   defp flush(state) do
     if ready?(state) do
