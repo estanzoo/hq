@@ -18,6 +18,11 @@ defmodule FakeHerdrTest do
     :ok = :gen_tcp.send(sock, [line, ?\n])
   end
 
+  defp request_with_id(sock, id, method, params) do
+    line = JSON.encode!(%{"id" => id, "method" => method, "params" => params})
+    :ok = :gen_tcp.send(sock, [line, ?\n])
+  end
+
   test "answers a stubbed request and records the call", %{fake: fake, path: path} do
     FakeHerdr.stub(fake, "agent.list", %{"type" => "agent_list", "agents" => []})
 
@@ -69,5 +74,28 @@ defmodule FakeHerdrTest do
     {:ok, line} = :gen_tcp.recv(sock, 0, 1_000)
 
     assert %{"error" => %{"code" => "unstubbed"}} = JSON.decode!(line)
+  end
+
+  test "rejects a non-string id with invalid_request, mirroring the real server",
+       %{fake: fake, path: path} do
+    FakeHerdr.stub(fake, "ping", %{"type" => "pong"})
+
+    sock = connect(path)
+    request_with_id(sock, 1, "ping", %{})
+    {:ok, line} = :gen_tcp.recv(sock, 0, 1_000)
+
+    assert %{"id" => "", "error" => %{"code" => "invalid_request"}} = JSON.decode!(line)
+    # Rejected before dispatch: never recorded as a call against the stub.
+    assert FakeHerdr.calls(fake) == []
+  end
+
+  test "removes the socket file once the double stops" do
+    {:ok, fake} = FakeHerdr.start_link()
+    path = FakeHerdr.path(fake)
+    assert File.exists?(path)
+
+    :ok = GenServer.stop(fake)
+
+    refute File.exists?(path)
   end
 end

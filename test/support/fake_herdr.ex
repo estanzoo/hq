@@ -27,6 +27,12 @@ defmodule FakeHerdr do
 
   @impl true
   def init(opts) do
+    # Trap exits so terminate/2 runs (closing the listen socket and removing
+    # the .sock file) when our parent (the linked test process) exits, and so
+    # the linked accept-loop's exit arrives as a handle_info message instead
+    # of taking us down with it. See handle_info/2 below.
+    Process.flag(:trap_exit, true)
+
     path = Keyword.get_lazy(opts, :path, &tmp_path/0)
     File.mkdir_p!(Path.dirname(path))
     File.rm(path)
@@ -69,9 +75,39 @@ defmodule FakeHerdr do
   @impl true
   def handle_cast({:request, req, sock}, st) do
     %{"id" => id, "method" => method} = req
-    params = Map.get(req, "params", %{})
-    st = %{st | calls: [%{"method" => method, "params" => params} | st.calls]}
 
+    if is_binary(id) do
+      params = Map.get(req, "params", %{})
+      st = %{st | calls: [%{"method" => method, "params" => params} | st.calls]}
+      dispatch(id, method, sock, st)
+    else
+      # The real Herdr server rejects a non-string id before it ever reaches
+      # method dispatch, and replies with an empty string id. Mirror that:
+      # the request is never recorded as a call.
+      resp = %{
+        "id" => "",
+        "error" => %{"code" => "invalid_request", "message" => invalid_id_message(id)}
+      }
+
+      send_line(sock, resp)
+      :gen_tcp.close(sock)
+      {:noreply, st}
+    end
+  end
+
+  @impl true
+  def handle_info({:EXIT, _pid, _reason}, st), do: {:noreply, st}
+
+  @impl true
+  def terminate(_reason, st) do
+    :gen_tcp.close(st.listen)
+    File.rm(st.path)
+    :ok
+  end
+
+  # -- Internals ------------------------------------------------------------
+
+  defp dispatch(id, method, sock, st) do
     case method do
       "events.subscribe" ->
         send_line(sock, %{"id" => id, "result" => %{"type" => "subscription_started"}})
@@ -91,14 +127,16 @@ defmodule FakeHerdr do
     end
   end
 
-  @impl true
-  def terminate(_reason, st) do
-    :gen_tcp.close(st.listen)
-    File.rm(st.path)
-    :ok
+  # Only the integer case is verified against the live server's exact
+  # message text; other non-string types get a reasonable but unverified
+  # fallback since they aren't the shape a real client bug would produce.
+  defp invalid_id_message(id) when is_integer(id) do
+    "invalid request: invalid type: integer `#{id}`, expected a string"
   end
 
-  # -- Internals ------------------------------------------------------------
+  defp invalid_id_message(id) do
+    "invalid request: invalid type: #{inspect(id)}, expected a string"
+  end
 
   defp send_line(sock, map), do: :gen_tcp.send(sock, [JSON.encode!(map), ?\n])
 
