@@ -9,7 +9,7 @@ defmodule FakeHerdr do
   """
   use GenServer
 
-  defstruct [:path, :listen, calls: [], replies: %{}, subscribers: []]
+  defstruct [:path, :listen, :accept_loop, calls: [], replies: %{}, subscribers: []]
 
   # -- API ------------------------------------------------------------------
 
@@ -22,6 +22,14 @@ defmodule FakeHerdr do
   def subscriber_count(pid), do: GenServer.call(pid, :subscriber_count)
   def push_event(pid, kind, data), do: GenServer.call(pid, {:push_event, kind, data})
   def drop_subscribers(pid), do: GenServer.call(pid, :drop_subscribers)
+
+  @doc """
+  The pid of the linked accept-loop process. Exposed only so tests can prove
+  the handle_info/2 narrowing in this module: it is a genuine non-parent
+  linked process, so killing it abnormally is the one way (short of a real
+  crash inside accept_loop) to exercise that code path from outside.
+  """
+  def accept_loop_pid(pid), do: GenServer.call(pid, :accept_loop_pid)
 
   # -- Server ---------------------------------------------------------------
 
@@ -47,15 +55,16 @@ defmodule FakeHerdr do
       ])
 
     server = self()
-    spawn_link(fn -> accept_loop(listen, server) end)
+    accept_loop = spawn_link(fn -> accept_loop(listen, server) end)
 
-    {:ok, %__MODULE__{path: path, listen: listen}}
+    {:ok, %__MODULE__{path: path, listen: listen, accept_loop: accept_loop}}
   end
 
   @impl true
   def handle_call(:path, _from, st), do: {:reply, st.path, st}
   def handle_call(:calls, _from, st), do: {:reply, Enum.reverse(st.calls), st}
   def handle_call(:subscriber_count, _from, st), do: {:reply, length(st.subscribers), st}
+  def handle_call(:accept_loop_pid, _from, st), do: {:reply, st.accept_loop, st}
 
   def handle_call({:stub, method, reply}, _from, st) do
     {:reply, :ok, %{st | replies: Map.put(st.replies, method, reply)}}

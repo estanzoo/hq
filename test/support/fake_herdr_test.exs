@@ -117,22 +117,49 @@ defmodule FakeHerdrTest do
     assert wait_until(fn -> not File.exists?(path) end)
   end
 
-  test "an abnormal EXIT from a linked process brings the double down loudly", %{fake: fake} do
+  test "an abnormal EXIT from the accept-loop process brings the double down loudly",
+       %{fake: fake} do
     # This test process is fake's start_link parent (linked in setup), so
     # fake dying with a non-normal reason would otherwise propagate that
     # same EXIT signal here and kill this test process before the
     # assertion runs. Trap it so we can observe the crash instead.
     Process.flag(:trap_exit, true)
+
+    loop = FakeHerdr.accept_loop_pid(fake)
     ref = Process.monitor(fake)
 
     ExUnit.CaptureLog.capture_log(fn ->
-      # The accept-loop process is linked but is not FakeHerdr's start_link
-      # parent, so its EXIT goes through handle_info, not straight to
-      # terminate/2. We can't reach that pid from here, so send the same
-      # shaped message FakeHerdr would receive from it crashing abnormally.
-      send(fake, {:EXIT, self(), :boom})
-      assert_receive {:DOWN, ^ref, :process, ^fake, :boom}
+      # accept_loop is linked to fake but is NOT its start_link parent, so
+      # this EXIT genuinely reaches handle_info/2 -- unlike the parent's
+      # own EXIT, which OTP's gen_server core routes straight to
+      # terminate/2 for any reason, bypassing handle_info entirely. Using
+      # a real linked non-parent process (rather than a synthetic message
+      # with a made-up pid) is what makes this test actually exercise the
+      # handle_info clause under review, instead of passing vacuously.
+      Process.exit(loop, :boom)
+      assert_receive {:DOWN, ^ref, :process, ^fake, :boom}, 1_000
     end)
+  end
+
+  test "survives a benign EXIT from a non-parent process and keeps answering",
+       %{fake: fake, path: path} do
+    FakeHerdr.stub(fake, "ping", %{"type" => "pong"})
+
+    # A throwaway pid stands in for some other linked, non-parent process
+    # (like accept_loop) exiting benignly. Pins the handle_info narrowing
+    # from the other side: a future change that stopped on every reason,
+    # not just the non-benign ones, would fail this.
+    other = spawn(fn -> :ok end)
+    send(fake, {:EXIT, other, :normal})
+
+    assert Process.alive?(fake)
+
+    sock = connect(path)
+    request(sock, "ping", %{})
+    {:ok, line} = :gen_tcp.recv(sock, 0, 1_000)
+
+    assert %{"result" => %{"type" => "pong"}} = JSON.decode!(line)
+    assert Process.alive?(fake)
   end
 
   defp wait_until(fun, tries \\ 100) do
