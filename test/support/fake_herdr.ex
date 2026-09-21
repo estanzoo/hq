@@ -1,0 +1,140 @@
+defmodule FakeHerdr do
+  @moduledoc """
+  A real unix-socket server speaking Herdr's wire protocol.
+
+  Mirrors the two protocol properties that constrain the client: exactly one
+  request is answered per connection, and a connection that subscribes to
+  events thereafter carries only events. A client that violates either will
+  hang here, which is the point.
+  """
+  use GenServer
+
+  defstruct [:path, :listen, calls: [], replies: %{}, subscribers: []]
+
+  # -- API ------------------------------------------------------------------
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts)
+
+  def path(pid), do: GenServer.call(pid, :path)
+  def stub(pid, method, result), do: GenServer.call(pid, {:stub, method, {:result, result}})
+  def stub_error(pid, method, error), do: GenServer.call(pid, {:stub, method, {:error, error}})
+  def calls(pid), do: GenServer.call(pid, :calls)
+  def subscriber_count(pid), do: GenServer.call(pid, :subscriber_count)
+  def push_event(pid, kind, data), do: GenServer.call(pid, {:push_event, kind, data})
+  def drop_subscribers(pid), do: GenServer.call(pid, :drop_subscribers)
+
+  # -- Server ---------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    path = Keyword.get_lazy(opts, :path, &tmp_path/0)
+    File.mkdir_p!(Path.dirname(path))
+    File.rm(path)
+
+    {:ok, listen} =
+      :gen_tcp.listen(0, [
+        :binary,
+        {:ifaddr, {:local, path}},
+        active: false,
+        packet: :line,
+        reuseaddr: true
+      ])
+
+    server = self()
+    spawn_link(fn -> accept_loop(listen, server) end)
+
+    {:ok, %__MODULE__{path: path, listen: listen}}
+  end
+
+  @impl true
+  def handle_call(:path, _from, st), do: {:reply, st.path, st}
+  def handle_call(:calls, _from, st), do: {:reply, Enum.reverse(st.calls), st}
+  def handle_call(:subscriber_count, _from, st), do: {:reply, length(st.subscribers), st}
+
+  def handle_call({:stub, method, reply}, _from, st) do
+    {:reply, :ok, %{st | replies: Map.put(st.replies, method, reply)}}
+  end
+
+  def handle_call({:push_event, kind, data}, _from, st) do
+    line = [JSON.encode!(%{"event" => kind, "data" => data}), ?\n]
+    Enum.each(st.subscribers, &:gen_tcp.send(&1, line))
+    {:reply, :ok, st}
+  end
+
+  def handle_call(:drop_subscribers, _from, st) do
+    Enum.each(st.subscribers, &:gen_tcp.close/1)
+    {:reply, :ok, %{st | subscribers: []}}
+  end
+
+  @impl true
+  def handle_cast({:request, req, sock}, st) do
+    %{"id" => id, "method" => method} = req
+    params = Map.get(req, "params", %{})
+    st = %{st | calls: [%{"method" => method, "params" => params} | st.calls]}
+
+    case method do
+      "events.subscribe" ->
+        send_line(sock, %{"id" => id, "result" => %{"type" => "subscription_started"}})
+        {:noreply, %{st | subscribers: [sock | st.subscribers]}}
+
+      _ ->
+        resp =
+          case Map.get(st.replies, method) do
+            {:result, result} -> %{"id" => id, "result" => result}
+            {:error, error} -> %{"id" => id, "error" => error}
+            nil -> %{"id" => id, "error" => %{"code" => "unstubbed", "message" => method}}
+          end
+
+        send_line(sock, resp)
+        :gen_tcp.close(sock)
+        {:noreply, st}
+    end
+  end
+
+  @impl true
+  def terminate(_reason, st) do
+    :gen_tcp.close(st.listen)
+    File.rm(st.path)
+    :ok
+  end
+
+  # -- Internals ------------------------------------------------------------
+
+  defp send_line(sock, map), do: :gen_tcp.send(sock, [JSON.encode!(map), ?\n])
+
+  defp accept_loop(listen, server) do
+    case :gen_tcp.accept(listen) do
+      {:ok, sock} ->
+        pid = spawn(fn -> handle_conn(sock, server) end)
+        :ok = :gen_tcp.controlling_process(sock, pid)
+        send(pid, :go)
+        accept_loop(listen, server)
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  defp handle_conn(sock, server) do
+    receive do
+      :go -> :ok
+    after
+      1_000 -> :ok
+    end
+
+    case :gen_tcp.recv(sock, 0, 5_000) do
+      {:ok, line} ->
+        # Hand ownership to the server so a subscription outlives this process.
+        :ok = :gen_tcp.controlling_process(sock, server)
+        GenServer.cast(server, {:request, JSON.decode!(line), sock})
+
+      _ ->
+        :gen_tcp.close(sock)
+    end
+  end
+
+  defp tmp_path do
+    rand = Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+    Path.join(System.tmp_dir!(), "fake-herdr-#{rand}.sock")
+  end
+end
