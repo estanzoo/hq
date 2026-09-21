@@ -12,8 +12,11 @@ defmodule Hq.Application do
   # global Roster and control socket.
   defp children do
     if Application.get_env(:hq, :start_children, true) do
-      # Registry, SessionSup, Roster and Control are added as they are built.
-      []
+      # Roster and Control are added as they are built.
+      [
+        {Registry, keys: :unique, name: Hq.Registry},
+        Hq.SessionSup
+      ]
     else
       []
     end
