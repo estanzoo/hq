@@ -95,8 +95,19 @@ defmodule FakeHerdr do
     end
   end
 
+  # The parent's own EXIT never reaches here: OTP's gen_server loop routes
+  # an EXIT from the process that called start_link straight to terminate/2
+  # before we ever see it. In practice this clause only sees the linked
+  # accept-loop process, so only benign reasons are swallowed; anything else
+  # (e.g. a crashed match in accept_loop) stops the double loudly instead of
+  # leaving it to hang every later connect with no attribution.
   @impl true
-  def handle_info({:EXIT, _pid, _reason}, st), do: {:noreply, st}
+  def handle_info({:EXIT, _pid, reason}, st) when reason in [:normal, :shutdown] do
+    {:noreply, st}
+  end
+
+  def handle_info({:EXIT, _pid, {:shutdown, _}}, st), do: {:noreply, st}
+  def handle_info({:EXIT, _pid, reason}, st), do: {:stop, reason, st}
 
   @impl true
   def terminate(_reason, st) do

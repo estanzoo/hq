@@ -89,13 +89,63 @@ defmodule FakeHerdrTest do
     assert FakeHerdr.calls(fake) == []
   end
 
-  test "removes the socket file once the double stops" do
-    {:ok, fake} = FakeHerdr.start_link()
-    path = FakeHerdr.path(fake)
-    assert File.exists?(path)
+  test "removes the socket file when its starting process exits normally" do
+    test_pid = self()
 
-    :ok = GenServer.stop(fake)
+    # GenServer.stop/1 already ran terminate/2 before the trap_exit fix, so
+    # it proves nothing about the parent-exit path that was actually
+    # leaking. Exercise that path directly: start FakeHerdr from a process
+    # other than this test, let that process exit normally, and confirm
+    # FakeHerdr (its real start_link parent) cleaned up in response.
+    {starter, ref} =
+      spawn_monitor(fn ->
+        {:ok, fake} = FakeHerdr.start_link()
+        send(test_pid, {:started, FakeHerdr.path(fake)})
+      end)
 
-    refute File.exists?(path)
+    path =
+      receive do
+        {:started, path} -> path
+      after
+        1_000 -> flunk("starter process did not report its path")
+      end
+
+    assert_receive {:DOWN, ^ref, :process, ^starter, :normal}
+
+    # terminate/2 runs on FakeHerdr's own schedule after the parent-EXIT
+    # message is delivered, so poll briefly instead of asserting instantly.
+    assert wait_until(fn -> not File.exists?(path) end)
+  end
+
+  test "an abnormal EXIT from a linked process brings the double down loudly", %{fake: fake} do
+    # This test process is fake's start_link parent (linked in setup), so
+    # fake dying with a non-normal reason would otherwise propagate that
+    # same EXIT signal here and kill this test process before the
+    # assertion runs. Trap it so we can observe the crash instead.
+    Process.flag(:trap_exit, true)
+    ref = Process.monitor(fake)
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      # The accept-loop process is linked but is not FakeHerdr's start_link
+      # parent, so its EXIT goes through handle_info, not straight to
+      # terminate/2. We can't reach that pid from here, so send the same
+      # shaped message FakeHerdr would receive from it crashing abnormally.
+      send(fake, {:EXIT, self(), :boom})
+      assert_receive {:DOWN, ^ref, :process, ^fake, :boom}
+    end)
+  end
+
+  defp wait_until(fun, tries \\ 100) do
+    cond do
+      fun.() ->
+        true
+
+      tries <= 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        wait_until(fun, tries - 1)
+    end
   end
 end
