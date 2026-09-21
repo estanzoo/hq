@@ -11,6 +11,12 @@ defmodule Hq.Session do
 
   @ready ~w(idle done)
 
+  # A settle-triggered flush can occupy the Session process for up to the
+  # bounded `agent.prompt` call in `flush/1` (10s). This gives a queued
+  # caller room to wait out that worst case instead of crashing on the 5s
+  # GenServer.call default.
+  @call_timeout 30_000
+
   defstruct [
     :name,
     :pane_id,
@@ -32,13 +38,14 @@ defmodule Hq.Session do
   def via(name), do: {:via, Registry, {Hq.Registry, name}}
 
   @spec deliver(String.t(), String.t(), String.t()) :: :ok
-  def deliver(name, from, body), do: GenServer.call(via(name), {:deliver, from, body})
+  def deliver(name, from, body),
+    do: GenServer.call(via(name), {:deliver, from, body}, @call_timeout)
 
   @spec info(String.t()) :: map()
-  def info(name), do: GenServer.call(via(name), :info)
+  def info(name), do: GenServer.call(via(name), :info, @call_timeout)
 
   @spec pending(String.t()) :: [map()]
-  def pending(name), do: GenServer.call(via(name), :pending)
+  def pending(name), do: GenServer.call(via(name), :pending, @call_timeout)
 
   @spec alive?(String.t()) :: boolean()
   def alive?(name), do: Registry.lookup(Hq.Registry, name) != []
@@ -145,8 +152,13 @@ defmodule Hq.Session do
       text = Hq.Envelope.render(msgs)
 
       # No `wait`: the Session learns the outcome from status events instead of
-      # blocking its own mailbox on the call.
-      case Hq.Herdr.call("agent.prompt", %{"target" => state.name, "text" => text}) do
+      # blocking its own mailbox on the call. Bounded well under the 30s
+      # Herdr client default: a prompt is a local unix-socket write, so 10s
+      # is already far beyond any healthy case, and it caps how long this
+      # process can be occupied against a concurrent caller's patience above.
+      case Hq.Herdr.call("agent.prompt", %{"target" => state.name, "text" => text},
+             timeout: 10_000
+           ) do
         {:ok, _} ->
           # Only drain (and persist the truncation) once delivery has actually
           # succeeded — draining first would durably erase mail the agent

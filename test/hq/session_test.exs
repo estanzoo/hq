@@ -150,19 +150,16 @@ defmodule Hq.SessionTest do
   end
 
   test "coalesces a burst into ONE prompt, not one per message", %{fake: fake} do
-    stub_status(fake, "working")
-    start_session("working")
+    # The agent is already idle: without a settle window, each `deliver`
+    # below would find `ready?` true immediately and flush on its own,
+    # producing three separate prompts. Only the settle window holds them
+    # long enough to land in one.
+    stub_status(fake, "idle")
+    start_session("idle")
 
     Hq.Session.deliver("worker-b", "worker-a", "one")
     Hq.Session.deliver("worker-b", "worker-c", "two")
     Hq.Session.deliver("worker-b", "worker-a", "three")
-
-    stub_status(fake, "idle")
-
-    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
-      "pane_id" => @pane,
-      "agent_status" => "idle"
-    })
 
     assert eventually(fn -> length(prompts(fake)) == 1 end)
     Process.sleep(60)
@@ -170,8 +167,13 @@ defmodule Hq.SessionTest do
 
     [%{"params" => %{"text" => text}}] = prompts(fake)
     assert text =~ "[hq] 3 messages"
-    assert text =~ "from worker-a:\none"
-    assert text =~ "from worker-c:\ntwo"
+
+    # FIFO order, not just presence.
+    {one_at, _} = :binary.match(text, "from worker-a:\none")
+    {two_at, _} = :binary.match(text, "from worker-c:\ntwo")
+    {three_at, _} = :binary.match(text, "from worker-a:\nthree")
+    assert one_at < two_at
+    assert two_at < three_at
   end
 
   test "a status flap does not cause a double delivery", %{fake: fake} do
@@ -179,14 +181,29 @@ defmodule Hq.SessionTest do
     start_session("working")
 
     Hq.Session.deliver("worker-b", "worker-a", "once only")
-    stub_status(fake, "idle")
 
+    # Push several idle events while the authoritative read still says
+    # working: each settle window that fires re-checks status via `agent.get`
+    # and finds nothing ready, so no flush completes and the one message
+    # stays queued — this is what distinguishes "settled once, found not
+    # ready" from "drained on the first event."
     for _ <- 1..5 do
       FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
         "pane_id" => @pane,
         "agent_status" => "idle"
       })
     end
+
+    Process.sleep(60)
+    assert prompts(fake) == []
+    assert Hq.Session.info("worker-b")["mailbox"] == 1
+
+    stub_status(fake, "idle")
+
+    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+      "pane_id" => @pane,
+      "agent_status" => "idle"
+    })
 
     assert eventually(fn -> length(prompts(fake)) == 1 end)
     Process.sleep(60)
