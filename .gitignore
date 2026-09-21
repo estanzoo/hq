@@ -1,0 +1,5 @@
+_build/
+deps/
+*.ez
+hq
+.elixir_ls/
