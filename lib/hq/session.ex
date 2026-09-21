@@ -119,18 +119,22 @@ defmodule Hq.Session do
 
   defp flush(state) do
     if ready?(state) do
-      {msgs, mailbox} = Hq.Mailbox.drain(state.mailbox)
+      msgs = Hq.Mailbox.peek(state.mailbox)
       text = Hq.Envelope.render(msgs)
 
       # No `wait`: the Session learns the outcome from status events instead of
       # blocking its own mailbox on the call.
       case Hq.Herdr.call("agent.prompt", %{"target" => state.name, "text" => text}) do
         {:ok, _} ->
+          # Only drain (and persist the truncation) once delivery has actually
+          # succeeded — draining first would durably erase mail the agent
+          # never received.
+          {_delivered, mailbox} = Hq.Mailbox.drain(state.mailbox)
           %{state | mailbox: mailbox}
 
         {:error, reason} ->
           Logger.warning("hq: delivery to #{state.name} failed: #{inspect(reason)}")
-          # Mailbox untouched — retried on the next ready transition.
+          # Nothing drained, nothing persisted — retried on the next ready transition.
           state
       end
     else

@@ -121,6 +121,13 @@ defmodule Hq.SessionTest do
 
     assert Hq.Session.info("worker-b")["mailbox"] == 1
 
+    # Prove durability, not just in-memory state: reload the mailbox
+    # independently from disk. A failed delivery must never have drained
+    # (and thus truncated) the persisted file.
+    reloaded = Hq.Mailbox.load("worker-b")
+    assert Hq.Mailbox.depth(reloaded) == 1
+    assert [%{"body" => "retry me", "from" => "worker-a"}] = reloaded.pending
+
     FakeHerdr.stub(fake, "agent.prompt", %{"type" => "agent_prompt", "submitted" => true})
 
     FakeHerdr.push_event(fake, "pane_agent_status_changed", %{

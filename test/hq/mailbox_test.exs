@@ -47,6 +47,16 @@ defmodule Hq.MailboxTest do
     assert Hq.Mailbox.depth(Hq.Mailbox.load("worker-a")) == 0
   end
 
+  test "peek returns pending messages without draining or persisting" do
+    mb = Hq.Mailbox.load("worker-a") |> Hq.Mailbox.enqueue("alice", "look but don't touch")
+
+    msgs = Hq.Mailbox.peek(mb)
+
+    assert ["look but don't touch"] == Enum.map(msgs, & &1["body"])
+    assert Hq.Mailbox.depth(mb) == 1
+    assert Hq.Mailbox.depth(Hq.Mailbox.load("worker-a")) == 1
+  end
+
   test "mailboxes are per-name" do
     Hq.Mailbox.load("worker-a") |> Hq.Mailbox.enqueue("alice", "for a")
 

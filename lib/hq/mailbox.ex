@@ -46,6 +46,9 @@ defmodule Hq.Mailbox do
     persist(%{mb | pending: mb.pending ++ [msg]})
   end
 
+  @spec peek(t()) :: [map()]
+  def peek(%__MODULE__{pending: pending}), do: pending
+
   @spec drain(t()) :: {[map()], t()}
   def drain(%__MODULE__{pending: []} = mb), do: {[], mb}
 
