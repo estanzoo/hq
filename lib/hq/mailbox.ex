@@ -64,7 +64,9 @@ defmodule Hq.Mailbox do
 
   defp persist(%__MODULE__{path: path, pending: pending} = mb) do
     File.mkdir_p!(Path.dirname(path))
-    File.write!(path, Enum.map(pending, &[JSON.encode!(&1), ?\n]))
+    tmp = path <> ".tmp"
+    File.write!(tmp, Enum.map(pending, &[JSON.encode!(&1), ?\n]))
+    File.rename!(tmp, path)
     mb
   end
 end

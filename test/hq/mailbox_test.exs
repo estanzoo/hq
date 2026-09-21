@@ -53,22 +53,52 @@ defmodule Hq.MailboxTest do
     assert Hq.Mailbox.depth(Hq.Mailbox.load("worker-b")) == 0
   end
 
-  test "skips corrupt lines without raising" do
-    # Create a file with one valid line, corrupt line, and another valid line
+  test "skips truncated final line — daemon killed mid-rewrite" do
+    # Simulate daemon killed mid-write: two complete lines followed by truncated JSON
     root = Application.get_env(:hq, :root)
     path = Path.join([root, "mailbox", "worker-c.ndjson"])
     File.mkdir_p!(Path.dirname(path))
 
     valid1 = JSON.encode!(%{"from" => "alice", "body" => "first", "at" => "2026-09-21T00:00:00Z"})
-    corrupt = "this is not valid json {{"
     valid2 = JSON.encode!(%{"from" => "bob", "body" => "second", "at" => "2026-09-21T00:01:00Z"})
+    truncated = ~s({"from":"carol","bo)
 
-    File.write!(path, "#{valid1}\n#{corrupt}\n#{valid2}\n")
+    File.write!(path, "#{valid1}\n#{valid2}\n#{truncated}")
 
-    # Load should skip the corrupt line
+    # Load should skip the truncated line and return only the two complete messages
     mb = Hq.Mailbox.load("worker-c")
     assert Hq.Mailbox.depth(mb) == 2
     bodies = Enum.map(mb.pending, & &1["body"])
     assert bodies == ["first", "second"]
+  end
+
+  test "old content survives a failed write" do
+    # First enqueue two messages
+    mb =
+      Hq.Mailbox.load("worker-d")
+      |> Hq.Mailbox.enqueue("alice", "msg1")
+      |> Hq.Mailbox.enqueue("bob", "msg2")
+
+    assert Hq.Mailbox.depth(mb) == 2
+
+    # Now make persist fail by creating a directory at the .tmp path
+    # so File.write! to .tmp will raise
+    root = Application.get_env(:hq, :root)
+    tmp_path = Path.join([root, "mailbox", "worker-d.ndjson.tmp"])
+    File.mkdir_p!(tmp_path)
+
+    # Try to enqueue a third message; this should raise when trying to write .tmp
+    assert_raise File.Error, fn ->
+      Hq.Mailbox.enqueue(mb, "carol", "msg3")
+    end
+
+    # Clean up the directory we created
+    File.rmdir(tmp_path)
+
+    # Verify the original two messages are still there — the failed write did not destroy them
+    reloaded = Hq.Mailbox.load("worker-d")
+    assert Hq.Mailbox.depth(reloaded) == 2
+    bodies = Enum.map(reloaded.pending, & &1["body"])
+    assert bodies == ["msg1", "msg2"]
   end
 end
