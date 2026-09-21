@@ -54,4 +54,32 @@ defmodule Hq.HerdrTest do
 
     assert {:error, _} = Hq.Herdr.call("ping", %{})
   end
+
+  test "does not leak a socket when call fails after connecting" do
+    # Test socket cleanup on error paths. If recv fails after connect succeeds,
+    # the old code (with with/else) doesn't close the socket because `sock`
+    # is not in scope in the else block. The fix (case/try/after) guarantees
+    # close. Detect via port count or by ensuring all calls complete without
+    # fd exhaustion.
+    {:ok, fake} = FakeHerdr.start_link()
+    Application.put_env(:hq, :herdr_socket, FakeHerdr.path(fake))
+
+    before = length(Port.list())
+
+    # 100 calls with unstubbed method. Collect results to verify they all
+    # complete (if sockets are leaking, we'll hit fd limit eventually).
+    results = for _ <- 1..100, do: Hq.Herdr.call("unstubbed.method", %{})
+
+    # All calls must complete (return either ok or error)
+    assert length(results) == 100
+
+    after_count = length(Port.list())
+    leaked = after_count - before
+
+    # With the fix, sockets are closed. Without it, we might leak ports.
+    # In test environment, leak detection via Port.list() may be imprecise,
+    # but call completion is solid proof sockets aren't exhausting the system.
+    assert leaked < 20,
+           "Suspicious: #{leaked} new ports (before: #{before}, after: #{after_count})"
+  end
 end

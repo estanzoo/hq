@@ -14,13 +14,21 @@ defmodule Hq.Herdr do
   def call(method, params \\ %{}, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    with {:ok, sock} <- connect(timeout),
-         :ok <- send_request(sock, method, params),
-         {:ok, line} <- :gen_tcp.recv(sock, 0, timeout) do
-      :gen_tcp.close(sock)
-      decode(line)
-    else
-      {:error, reason} -> {:error, reason}
+    case connect(timeout) do
+      {:ok, sock} ->
+        try do
+          with :ok <- send_request(sock, method, params),
+               {:ok, line} <- :gen_tcp.recv(sock, 0, timeout) do
+            decode(line)
+          else
+            {:error, reason} -> {:error, reason}
+          end
+        after
+          :gen_tcp.close(sock)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
