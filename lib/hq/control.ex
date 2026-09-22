@@ -111,6 +111,14 @@ defmodule Hq.Control do
     Hq.Control.Handler.handle(Map.put_new(req, "args", %{}))
   rescue
     e -> {:error, %{"code" => "internal", "message" => Exception.message(e)}}
+  catch
+    # `rescue` only catches raised exceptions, not exits. `send`/`inbox`/
+    # `release` all check `Hq.Session.alive?/1` (a Registry read) and then
+    # `GenServer.call` through the same `:via` tuple — if the Session dies in
+    # that window the call exits `:noproc` instead of raising, and without
+    # this clause the connection would just drop with no envelope at all,
+    # violating the "every request gets an ok/error envelope" contract.
+    :exit, reason -> {:error, %{"code" => "internal", "message" => inspect(reason)}}
   end
 
   defp reply(sock, {:ok, result}),

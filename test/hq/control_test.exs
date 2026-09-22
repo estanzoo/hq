@@ -69,6 +69,39 @@ defmodule Hq.ControlTest do
              request("send", %{"to" => "ghost", "from" => "worker-a", "body" => "hi"})
   end
 
+  # `dispatch/1` catches exceptions but exits are different: a Session that
+  # dies between the handler's `alive?` check and its `GenServer.call` raises
+  # `:exit`, not something `rescue` sees. Reaching that window via a real
+  # Session death is racy (Registry cleanup is async), so instead this
+  # registers a plain, non-GenServer process under the target name and has it
+  # crash the instant it receives the call message the `send` verb sends it —
+  # deterministic, no timing dependency: the process is confirmed registered
+  # before the request is ever issued, and it only crashes in direct response
+  # to that request's own GenServer.call.
+  test "a verb whose target dies mid-call still returns a well-formed error envelope" do
+    test_pid = self()
+
+    zombie =
+      spawn(fn ->
+        {:ok, _} = Registry.register(Hq.Registry, "zombie", nil)
+        send(test_pid, :registered)
+
+        receive do
+          _ -> raise "simulated crash mid-call"
+        end
+      end)
+
+    assert_receive :registered, 1_000
+    assert Hq.Session.alive?("zombie")
+
+    ref = Process.monitor(zombie)
+
+    assert %{"ok" => false, "error" => %{"code" => "internal"}} =
+             request("send", %{"to" => "zombie", "from" => "worker-a", "body" => "hi"})
+
+    assert_receive {:DOWN, ^ref, :process, ^zombie, _reason}, 1_000
+  end
+
   test "inbox reports pending messages for a name" do
     {:ok, _} = Hq.Roster.adopt("worker-b", "w6:p1")
     Hq.Session.deliver("worker-b", "worker-a", "pending")
@@ -81,7 +114,13 @@ defmodule Hq.ControlTest do
     {:ok, _} = Hq.Roster.adopt("worker-a", "w5:p1")
 
     assert %{"ok" => true} = request("release", %{"name" => "worker-a"})
-    refute Hq.Session.alive?("worker-a")
+
+    # `stop_session` (DynamicSupervisor.terminate_child) confirms the process
+    # exited but does not wait for Registry's own, independent monitor to
+    # process that death and remove the entry — the same race
+    # `d646036` diagnosed and fixed for the identical stop_session -> alive?
+    # shape elsewhere in this repo. Poll instead of reading `alive?` once.
+    assert eventually(fn -> not Hq.Session.alive?("worker-a") end)
   end
 
   test "register names a pane and supervises it", %{fake: fake} do
@@ -126,5 +165,16 @@ defmodule Hq.ControlTest do
 
     assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
     refute File.exists?(path)
+  end
+
+  defp eventually(fun, tries \\ 50) do
+    Enum.reduce_while(1..tries, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        Process.sleep(20)
+        {:cont, false}
+      end
+    end)
   end
 end
