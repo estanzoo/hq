@@ -26,6 +26,16 @@ defmodule Hq.Control.Handler do
     end
   end
 
+  def handle(%{"verb" => "inbox", "args" => %{"pane_id" => pane_id}}) do
+    case Enum.find(Hq.SessionSup.list(), &(&1["pane_id"] == pane_id)) do
+      nil ->
+        {:error, %{"code" => "not_registered", "message" => "this pane is not supervised by hq"}}
+
+      %{"name" => name} ->
+        {:ok, %{"pending" => Hq.Session.pending(name)}}
+    end
+  end
+
   def handle(%{"verb" => "inbox", "args" => %{"name" => name}}) do
     if Hq.Session.alive?(name) do
       {:ok, %{"pending" => Hq.Session.pending(name)}}
