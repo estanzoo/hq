@@ -62,10 +62,7 @@ defmodule Hq.Control.Handler do
     end
   end
 
-  # `spawn` arrives in the next task with Hq.Spawner. Adding that clause here
-  # ahead of the module it calls would be a forward reference to an undefined
-  # module — it compiles (Elixir does not check call targets at compile time)
-  # but warns, and this project's compile gate treats warnings as errors.
+  def handle(%{"verb" => "spawn", "args" => args}), do: Hq.Spawner.spawn_agent(args)
 
   def handle(%{"verb" => verb}) do
     {:error, %{"code" => "unknown_verb", "message" => to_string(verb)}}
