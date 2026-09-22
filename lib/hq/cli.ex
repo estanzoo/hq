@@ -193,11 +193,11 @@ defmodule Hq.CLI do
     {verb, args} = parse(argv)
     args = decorate(args)
 
-    case request(verb, args) do
-      {:ok, result} ->
-        IO.puts(render(verb, result))
-        System.halt(0)
-
+    with :ok <- require_pane(verb),
+         {:ok, result} <- request(verb, args) do
+      IO.puts(render(verb, result))
+      System.halt(0)
+    else
       {:error, error} ->
         IO.puts(:stderr, "hq: #{error["message"] || error["code"]}")
 
@@ -209,6 +209,38 @@ defmodule Hq.CLI do
         System.halt(1)
     end
   end
+
+  # `register` and `inbox` both resolve the caller's own session from
+  # `$HERDR_PANE_ID` (see `put_self_name/1` above) rather than an explicit
+  # name argument. Outside a Herdr pane that variable is unset, `decorate/1`
+  # never attaches `pane_id`, no handler clause matches either verb, and the
+  # request used to reach the daemon anyway and come back as a bare
+  # `unknown_verb` naming the verb itself (e.g. `hq: register`) -- telling
+  # the caller neither the real cause nor the remedy. Catching this
+  # client-side, before `request/2` ever opens a socket, means the daemon is
+  # never contacted for a request that cannot succeed, and the message
+  # actually explains what to do. Public (like `decorate/1`) so a test can
+  # assert on the `{:error, map()}` directly without going through
+  # `System.halt/1`.
+  @spec require_pane(String.t()) :: :ok | {:error, map()}
+  def require_pane(verb) when verb in ["register", "inbox"] do
+    case System.get_env("HERDR_PANE_ID") do
+      nil ->
+        {:error,
+         %{
+           "code" => "no_pane",
+           "message" =>
+             "not running inside a Herdr pane ($HERDR_PANE_ID is unset)\n" <>
+               "     `hq register` and `hq inbox` identify your session by its pane.\n" <>
+               "     Start this session inside Herdr, or pass an explicit target."
+         }}
+
+      _pane ->
+        :ok
+    end
+  end
+
+  def require_pane(_verb), do: :ok
 
   # The args-decoration pipeline `run_verb/1` applies before every request:
   # the caller's own identity comes from the pane it is running in. Public

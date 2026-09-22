@@ -92,6 +92,10 @@ defmodule Hq.CLITest do
 
     assert args["pane_id"] == "w1:p1"
 
+    # The pane-required guard (see "require_pane/1" below) must not block the
+    # happy path: `run_verb/1` checks it before every `request/2`.
+    assert :ok = Hq.CLI.require_pane(verb)
+
     assert {:ok, %{"name" => "boss", "pane_id" => "w1:p1"}} = Hq.CLI.request(verb, args)
     assert Hq.Session.alive?("boss")
 
@@ -109,8 +113,60 @@ defmodule Hq.CLITest do
     {verb, args} = Hq.CLI.parse(["inbox"])
     args = Hq.CLI.decorate(args)
 
+    assert :ok = Hq.CLI.require_pane(verb)
+
     assert {:ok, %{"pending" => [%{"body" => "hi from the pane test"}]}} =
              Hq.CLI.request(verb, args)
+  end
+
+  # -- require_pane/1: register / inbox need $HERDR_PANE_ID -------------------
+  #
+  # Outside a Herdr pane, `register` and `inbox` used to reach the daemon
+  # anyway and come back as a bare `unknown_verb` naming the verb itself
+  # (e.g. `hq: register`) -- telling the caller neither the real cause nor
+  # the remedy. `run_verb/1` now checks `require_pane/1` before `request/2`,
+  # so a request that cannot succeed never opens a socket. These tests stop
+  # the (in-test) control listener first, so a test that wrongly fell through
+  # to `request/2` would surface as a connection failure instead of the clean
+  # `no_pane` error asserted here.
+  describe "require_pane/1" do
+    test "register: clear error with no HERDR_PANE_ID, daemon never contacted" do
+      System.delete_env("HERDR_PANE_ID")
+      :ok = stop_supervised(Hq.Control)
+
+      assert {:error, %{"code" => "no_pane", "message" => message}} =
+               Hq.CLI.require_pane("register")
+
+      assert message =~ "not running inside a Herdr pane"
+      assert message =~ "HERDR_PANE_ID"
+    end
+
+    test "inbox: clear error with no HERDR_PANE_ID, daemon never contacted" do
+      System.delete_env("HERDR_PANE_ID")
+      :ok = stop_supervised(Hq.Control)
+
+      assert {:error, %{"code" => "no_pane", "message" => message}} =
+               Hq.CLI.require_pane("inbox")
+
+      assert message =~ "not running inside a Herdr pane"
+    end
+
+    test "register and inbox pass when HERDR_PANE_ID is set" do
+      System.put_env("HERDR_PANE_ID", "w9:p1")
+      on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+      assert :ok = Hq.CLI.require_pane("register")
+      assert :ok = Hq.CLI.require_pane("inbox")
+    end
+
+    test "other verbs are unaffected by a missing HERDR_PANE_ID" do
+      System.delete_env("HERDR_PANE_ID")
+
+      assert :ok = Hq.CLI.require_pane("send")
+      assert :ok = Hq.CLI.require_pane("ls")
+      assert :ok = Hq.CLI.require_pane("spawn")
+      assert :ok = Hq.CLI.require_pane("release")
+    end
   end
 
   # -- socket lifecycle --------------------------------------------------------
