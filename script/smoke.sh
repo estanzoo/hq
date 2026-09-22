@@ -104,15 +104,38 @@ sleep 60
 echo "==> roster after"
 hq ls
 
-echo "==> smoke-b's pane (the message should be visible, prefixed [hq])"
-pane_b_output="$(herdr agent read "$NAME_B" --source recent-unwrapped --lines 40)"
+# The authoritative check. hq drains a mailbox ONLY after agent.prompt
+# returned success (see Hq.Session.flush/1 — it peeks, prompts, and drains
+# only on {:ok, _}), so a queue that went non-empty -> 0 is proof the
+# message was actually typed into the terminal. The pane read below is
+# corroborating evidence only: an agent's own output scrolls the marker out
+# of the read window, which produced a false FAIL on an earlier run whose
+# message was plainly visible in the pane.
+mail_b="$(hq ls | awk -v n="$NAME_B" '$1 == n {print $3}')"
+echo "==> smoke-b mailbox after delivery: $mail_b (want mail:0)"
+
+echo "==> smoke-b's pane (the [hq] message should be visible)"
+pane_b_output="$(herdr agent read "$NAME_B" --source recent-unwrapped --lines 200)"
 echo "$pane_b_output"
 
 echo
-if grep -q '\[hq\] message from' <<<"$pane_b_output"; then
-  echo "PASS: [hq]-prefixed message is visible in smoke-b's pane above."
+# Two envelope shapes, both legitimate: a lone message renders as
+# "[hq] message from <name>:", while several queued at once coalesce into
+# "[hq] N messages" followed by "from <name>:" blocks. A spawned agent
+# always receives at least the preamble and its task, so in practice this
+# run hits the plural form -- matching only the singular one reported a
+# false FAIL while the message was plainly visible in the pane.
+if [[ "$mail_b" == "mail:0" ]]; then
+  echo "PASS: smoke-b's mailbox drained to 0 — hq only drains after agent.prompt"
+  echo "      succeeded, so the message was delivered into its terminal."
+  if grep -qE '\[hq\] (message from|[0-9]+ messages)' <<<"$pane_b_output"; then
+    echo "      Corroborated: an [hq] envelope is also visible in the pane above."
+  else
+    echo "      (The [hq] marker has scrolled out of the pane read window; the"
+    echo "       drained mailbox is the authoritative signal.)"
+  fi
 else
-  echo "FAIL: no [hq]-prefixed message found in smoke-b's pane above."
+  echo "FAIL: smoke-b's mailbox is $mail_b, expected mail:0 — nothing was delivered."
   echo "      Check 'hq ls' output for mailbox depth and status: a session"
   echo "      stuck outside idle/done (e.g. the one-time trust dialog above,"
   echo "      or a stale hq status cache — see task-15-report.md) will queue"
