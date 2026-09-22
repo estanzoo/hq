@@ -5,6 +5,14 @@ defmodule Hq.Notify do
   A notice is ordinary `[hq]` mail, not a special channel: there is no
   orchestrator identity in the system, only participants. A session with no
   live parent logs instead, so a notice is never silently dropped.
+
+  A session whose `spawned_by` names itself is the same guarantee under a
+  different failure mode: delivering to it would be a `GenServer.call` from a
+  process to itself, made from inside that same process's own callback (a
+  blocked/exit transition calling `tell/2` synchronously). That deadlocks
+  until the call timeout kills it. The guard lives here rather than only at
+  the one place that constructs `spawned_by` today, so every caller —
+  present and future — is covered.
   """
   require Logger
 
@@ -15,10 +23,18 @@ defmodule Hq.Notify do
   end
 
   def tell(parent, body) do
-    if Hq.Session.alive?(parent) do
-      Hq.Session.deliver(parent, "hq", body)
-    else
-      Logger.info("hq: #{body}")
+    case GenServer.whereis(Hq.Session.via(parent)) do
+      nil ->
+        Logger.info("hq: #{body}")
+
+      pid when pid == self() ->
+        Logger.info(
+          "hq: #{parent} is its own spawned_by; not delivering to self to avoid " <>
+            "deadlocking: #{body}"
+        )
+
+      _pid ->
+        Hq.Session.deliver(parent, "hq", body)
     end
 
     :ok

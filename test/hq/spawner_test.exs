@@ -169,6 +169,13 @@ defmodule Hq.SpawnerTest do
              Hq.Spawner.spawn_agent(%{"name" => "Worker A", "from" => "boss"})
   end
 
+  test "rejects a self-referential spawned_by" do
+    assert {:error, %{"code" => "self_spawn"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "worker-a"})
+
+    refute Hq.Session.alive?("worker-a")
+  end
+
   test "rejects a name already in use" do
     assert {:ok, _} =
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})

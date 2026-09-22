@@ -199,10 +199,24 @@ defmodule Hq.Session do
 
   defp ready?(state), do: state.status in @ready and Hq.Mailbox.depth(state.mailbox) > 0
 
+  # A refresh is a re-read of existing state, not a transition, so it must
+  # never notify — that stays put_status/2's job. But it must not leave a
+  # stale latch behind either: observing anything other than "blocked" here
+  # means whatever blocked episode set notified_blocked (if any) is over, so
+  # the next genuine blocked transition should notify again. Observing
+  # "blocked" leaves the latch exactly as it was — set if we were already
+  # blocked and known, unset if this is the first time we're learning of it
+  # (in which case the *next* put_status/2 call, if any, decides).
   defp refresh_status(state) do
     case Hq.Herdr.call("agent.get", %{"target" => state.name}) do
-      {:ok, %{"agent" => %{"agent_status" => status}}} -> %{state | status: status}
-      _ -> state
+      {:ok, %{"agent" => %{"agent_status" => "blocked"}}} ->
+        %{state | status: "blocked"}
+
+      {:ok, %{"agent" => %{"agent_status" => status}}} ->
+        %{state | status: status, notified_blocked: false}
+
+      _ ->
+        state
     end
   end
 end

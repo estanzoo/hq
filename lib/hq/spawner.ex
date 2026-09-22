@@ -26,6 +26,13 @@ defmodule Hq.Spawner do
       Hq.Session.alive?(name) ->
         {:error, %{"code" => "name_taken", "message" => name}}
 
+      Map.get(args, "from") == name ->
+        {:error,
+         %{
+           "code" => "self_spawn",
+           "message" => "a session cannot be spawned_by itself: #{inspect(name)}"
+         }}
+
       true ->
         do_spawn(name, args)
     end
