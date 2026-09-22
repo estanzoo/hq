@@ -86,6 +86,33 @@ defmodule Hq.SessionTest do
     assert eventually(fn -> length(prompts(fake)) == 1 end)
   end
 
+  test "delivers on the DOTTED kind the real Herdr server actually pushes", %{fake: fake} do
+    # Measured against the live server: subscribing to the dotted
+    # subscription type `pane.agent_status_changed` gets pushed events back
+    # with that SAME dotted spelling in the `event` field — unlike
+    # `pane.closed`, which comes back snake_case. `Hq.Herdr.Events` must
+    # normalize this at the boundary so Session's flush logic (which matches
+    # one snake_case spelling) actually fires on a real transition, not just
+    # on the test double's snake_case shorthand used elsewhere in this file.
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "held then sent (dotted event)")
+    Process.sleep(50)
+    assert prompts(fake) == []
+
+    stub_status(fake, "idle")
+
+    FakeHerdr.push_event(fake, "pane.agent_status_changed", %{
+      "agent" => "claude",
+      "pane_id" => @pane,
+      "agent_status" => "idle",
+      "workspace_id" => "w5"
+    })
+
+    assert eventually(fn -> length(prompts(fake)) == 1 end)
+  end
+
   test "`done` counts as ready, same as idle", %{fake: fake} do
     stub_status(fake, "done")
     start_session("done")

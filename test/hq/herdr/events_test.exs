@@ -23,6 +23,44 @@ defmodule Hq.Herdr.EventsTest do
     assert_receive {:hq_event, "pane_agent_status_changed", %{"agent_status" => "idle"}}, 1_000
   end
 
+  # Herdr is inconsistent about the `event` field it pushes: measured against
+  # the live server, `pane.agent_status_changed` arrives DOTTED (verbatim,
+  # matching its subscription type), not snake_case. Reproduce exactly what
+  # the real server sends and prove it still reaches the owner normalized —
+  # this is the case the old, snake_case-only test above could not catch,
+  # because the fake it drove happened to mirror the same wrong assumption
+  # the production code made.
+  test "normalizes a DOTTED pushed kind to snake_case, as the real server sends it", %{
+    fake: fake
+  } do
+    subs = [%{"type" => "pane.agent_status_changed", "pane_id" => "wA:p4"}]
+    {:ok, _pid} = Hq.Herdr.Events.start_link(owner: self(), subscriptions: subs)
+
+    assert_receive {:hq_events, :connected}, 1_000
+
+    FakeHerdr.push_event(fake, "pane.agent_status_changed", %{
+      "agent" => "claude",
+      "agent_status" => "working",
+      "pane_id" => "wA:p4",
+      "workspace_id" => "wA"
+    })
+
+    assert_receive {:hq_event, "pane_agent_status_changed",
+                    %{"agent_status" => "working", "pane_id" => "wA:p4"}},
+                   1_000
+  end
+
+  test "leaves an already-snake_case pushed kind unchanged", %{fake: fake} do
+    subs = [%{"type" => "pane.closed"}]
+    {:ok, _pid} = Hq.Herdr.Events.start_link(owner: self(), subscriptions: subs)
+
+    assert_receive {:hq_events, :connected}, 1_000
+
+    FakeHerdr.push_event(fake, "pane_closed", %{"pane_id" => "w5:p1"})
+
+    assert_receive {:hq_event, "pane_closed", %{"pane_id" => "w5:p1"}}, 1_000
+  end
+
   test "sends the subscriptions verbatim", %{fake: fake} do
     subs = [%{"type" => "pane.agent_status_changed", "pane_id" => "w5:p1"}]
     {:ok, _} = Hq.Herdr.Events.start_link(owner: self(), subscriptions: subs)

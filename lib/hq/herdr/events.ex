@@ -44,7 +44,7 @@ defmodule Hq.Herdr.Events do
   def handle_info({:tcp, sock, line}, %{sock: sock} = state) do
     case JSON.decode(line) do
       {:ok, %{"event" => kind, "data" => data}} ->
-        send(state.owner, {:hq_event, kind, data})
+        send(state.owner, {:hq_event, normalize_kind(kind), data})
 
       _ ->
         :ok
@@ -108,4 +108,17 @@ defmodule Hq.Herdr.Events do
   end
 
   defp backoff(attempt), do: Enum.at(@backoff_ms, attempt, List.last(@backoff_ms))
+
+  # Herdr is inconsistent about the `event` field it pushes: measured against
+  # the live server (0.9.1, protocol 22), `pane.agent_status_changed` arrives
+  # DOTTED (matching its subscription type verbatim), while `pane.closed`
+  # arrives snake_case (`pane_closed`) — the two are not the same shape even
+  # though both are pushed on subscriptions requested the same way. A local
+  # test double that just mirrors whatever spelling the test hands it can't
+  # catch this; it has to be checked against the real server, which is how
+  # this was found. Normalizing once, here, at the boundary, means every
+  # consumer (Session, Roster, …) matches a single canonical spelling and
+  # stays correct regardless of which form Herdr happens to use for a given
+  # event kind today or after some future Herdr release.
+  defp normalize_kind(kind), do: String.replace(kind, ".", "_")
 end
