@@ -99,8 +99,19 @@ defmodule Hq.Roster do
   def handle_info({:hq_event, kind, %{"pane_id" => pane_id}}, state)
       when kind in ["pane_exited", "pane_closed"] do
     for entry <- remembered(), entry["pane_id"] == pane_id do
-      Logger.info("hq: reaping #{entry["name"]} — pane #{pane_id} is gone")
-      forget(entry["name"])
+      name = entry["name"]
+      undelivered = Hq.Mailbox.load(name) |> Hq.Mailbox.depth()
+
+      if undelivered > 0 do
+        Hq.Notify.tell(
+          entry["spawned_by"],
+          "#{name} exited with #{undelivered} undelivered message(s). " <>
+            "They are in #{Hq.Mailbox.path_for(name)}."
+        )
+      end
+
+      Logger.info("hq: reaping #{name} — pane #{pane_id} is gone")
+      forget(name)
     end
 
     {:noreply, state}

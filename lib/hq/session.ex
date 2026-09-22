@@ -25,7 +25,8 @@ defmodule Hq.Session do
     :events,
     :mailbox,
     status: "unknown",
-    settling: false
+    settling: false,
+    notified_blocked: false
   ]
 
   # -- API ------------------------------------------------------------------
@@ -109,7 +110,7 @@ defmodule Hq.Session do
          %{"pane_id" => pane_id, "agent_status" => status}},
         %{pane_id: pane_id} = state
       ) do
-    {:noreply, maybe_flush(%{state | status: status})}
+    {:noreply, state |> put_status(status) |> maybe_flush()}
   end
 
   # A reconnect can have missed transitions, so re-read rather than assume.
@@ -145,6 +146,26 @@ defmodule Hq.Session do
   end
 
   defp settle_ms, do: Application.get_env(:hq, :settle_ms, 400)
+
+  # hq never answers an approval dialog — a worker asking to do something
+  # unexpected is a human decision. It does make sure someone is told, once,
+  # rather than the mail sitting there silently.
+  defp put_status(state, "blocked") do
+    unless state.notified_blocked do
+      held = Hq.Mailbox.depth(state.mailbox)
+
+      Hq.Notify.tell(
+        state.spawned_by,
+        "#{state.name} is blocked on a dialog, #{held} " <>
+          "message#{if held == 1, do: "", else: "s"} held. " <>
+          "Inspect it with: herdr agent read #{state.name} --source detection"
+      )
+    end
+
+    %{state | status: "blocked", notified_blocked: true}
+  end
+
+  defp put_status(state, status), do: %{state | status: status, notified_blocked: false}
 
   defp flush(state) do
     if ready?(state) do
