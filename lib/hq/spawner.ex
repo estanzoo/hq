@@ -13,6 +13,21 @@ defmodule Hq.Spawner do
   @name_re ~r/^[a-z][a-z0-9_-]{0,31}$/
   @unset "unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN"
 
+  # Herdr requires the target pane to be idle at its interactive prompt
+  # before `agent.start` accepts it. prepare_env/3 just sent shell commands
+  # into the pane (worktree-env.sh, then the credential unset); for a moment
+  # after each Enter the shell is still running that command, so `agent.start`
+  # can land while the pane is briefly busy and get rejected with
+  # "agent_pane_busy" even though the pane will be ready an instant later.
+  # bdherd, the shell script this was ported from, papered over this with a
+  # blind `sleep 2` before starting the agent (reference/bdherd.bash:214-218)
+  # — too slow when the pane settles quickly, too short under load. Retry
+  # ONLY that specific error a bounded number of times instead, with a short
+  # pause between attempts: 8 attempts is roughly a 10s worst-case budget
+  # once Herdr's own response time under load is counted alongside our
+  # sleeps, without ever blocking a pane that is already available.
+  @pane_busy_attempts 8
+
   @spec spawn_agent(map()) :: {:ok, map()} | {:error, map()}
   def spawn_agent(%{"name" => name} = args) do
     cond do
@@ -178,8 +193,26 @@ defmodule Hq.Spawner do
         params
       end
 
-    Hq.Herdr.call("agent.start", params, timeout: 60_000)
+    start_agent_call(params, @pane_busy_attempts)
   end
+
+  # Any error other than agent_pane_busy — a bad name, a missing pane, an
+  # agent that failed to come up — is a genuine failure and must surface on
+  # the first attempt, unretried and unchanged.
+  defp start_agent_call(params, attempts_left) do
+    case Hq.Herdr.call("agent.start", params, timeout: 60_000) do
+      {:error, %{"code" => "agent_pane_busy"}} when attempts_left > 1 ->
+        Process.sleep(pane_settle_ms())
+        start_agent_call(params, attempts_left - 1)
+
+      # Bounded retries exhausted: return the last agent_pane_busy error
+      # rather than swallowing it, so the caller sees the real reason.
+      result ->
+        result
+    end
+  end
+
+  defp pane_settle_ms, do: Application.get_env(:hq, :pane_settle_ms, 300)
 
   defp first_message(name, args) do
     from = Map.get(args, "from", "hq")

@@ -7,6 +7,7 @@ defmodule Hq.SpawnerTest do
     Application.put_env(:hq, :herdr_socket, FakeHerdr.path(fake))
     Application.put_env(:hq, :root, root)
     Application.put_env(:hq, :settle_ms, 10)
+    Application.put_env(:hq, :pane_settle_ms, 1)
     on_exit(fn -> File.rm_rf(root) end)
 
     start_supervised!({Registry, keys: :unique, name: Hq.Registry})
@@ -191,5 +192,59 @@ defmodule Hq.SpawnerTest do
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
     refute Hq.Session.alive?("worker-a")
+  end
+
+  # Immediately after prepare_env/3 sends the credential-unset command, the
+  # pane is briefly still "running" that command in Herdr's eyes, so
+  # agent.start can be rejected with agent_pane_busy even though the pane is
+  # about to be ready. This must be retried transparently.
+  test "retries agent.start when the pane is briefly busy, then succeeds", %{fake: fake} do
+    FakeHerdr.stub_sequence(fake, "agent.start", [
+      {:error, %{"code" => "agent_pane_busy", "message" => "not an available shell"}},
+      {:ok, %{"type" => "agent_start", "agent" => %{"name" => "worker-a"}}}
+    ])
+
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert Hq.Session.alive?("worker-a")
+
+    starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
+    assert length(starts) == 2
+  end
+
+  # A non-busy failure (bad name, missing pane, agent never came up, ...) is
+  # a genuine error, not a transient one. It must fail on the FIRST attempt —
+  # asserting the call count here means an implementation that blindly
+  # retries every agent.start error, not just agent_pane_busy, fails this
+  # test.
+  test "does not retry a non-busy agent.start error", %{fake: fake} do
+    FakeHerdr.stub_error(fake, "agent.start", %{"code" => "agent_not_ready", "message" => "nope"})
+
+    assert {:error, %{"code" => "spawn_failed"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
+    assert length(starts) == 1
+  end
+
+  # The retry loop must be bounded, not infinite: if the pane never settles,
+  # give up and surface the real agent_pane_busy error rather than hanging
+  # or swallowing it into something unrecognizable.
+  test "gives up after exhausting bounded retries and surfaces the busy error", %{fake: fake} do
+    FakeHerdr.stub_error(fake, "agent.start", %{
+      "code" => "agent_pane_busy",
+      "message" => "not an available shell"
+    })
+
+    assert {:error, %{"code" => "spawn_failed", "message" => message}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert message =~ "agent_pane_busy"
+    refute Hq.Session.alive?("worker-a")
+
+    starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
+    assert length(starts) <= 10
+    assert length(starts) > 1
   end
 end

@@ -18,6 +18,26 @@ defmodule FakeHerdr do
   def path(pid), do: GenServer.call(pid, :path)
   def stub(pid, method, result), do: GenServer.call(pid, {:stub, method, {:result, result}})
   def stub_error(pid, method, error), do: GenServer.call(pid, {:stub, method, {:error, error}})
+
+  @doc """
+  Stubs `method` with a queue of responses consumed one per call, each either
+  `{:ok, result}` or `{:error, error}` — for exercising a caller's retry
+  logic, e.g. "fails with X, then succeeds". The last entry sticks: once the
+  queue is down to one element, every further call keeps returning it rather
+  than falling through to `unstubbed`, so a caller that (correctly, or
+  buggily) makes more calls than the queue anticipated still gets a
+  meaningful reply.
+  """
+  def stub_sequence(pid, method, replies) when is_list(replies) and replies != [] do
+    wrapped =
+      Enum.map(replies, fn
+        {:ok, result} -> {:result, result}
+        {:error, error} -> {:error, error}
+      end)
+
+    GenServer.call(pid, {:stub, method, {:sequence, wrapped}})
+  end
+
   def calls(pid), do: GenServer.call(pid, :calls)
   def subscriber_count(pid), do: GenServer.call(pid, :subscriber_count)
   def push_event(pid, kind, data), do: GenServer.call(pid, {:push_event, kind, data})
@@ -134,18 +154,36 @@ defmodule FakeHerdr do
         {:noreply, %{st | subscribers: [sock | st.subscribers]}}
 
       _ ->
-        resp =
-          case Map.get(st.replies, method) do
-            {:result, result} -> %{"id" => id, "result" => result}
-            {:error, error} -> %{"id" => id, "error" => error}
-            nil -> %{"id" => id, "error" => %{"code" => "unstubbed", "message" => method}}
-          end
-
-        send_line(sock, resp)
+        {body, st} = take_reply(st, method)
+        send_line(sock, Map.put(body, "id", id))
         :gen_tcp.close(sock)
         {:noreply, st}
     end
   end
+
+  defp take_reply(st, method) do
+    case Map.get(st.replies, method) do
+      {:result, result} ->
+        {%{"result" => result}, st}
+
+      {:error, error} ->
+        {%{"error" => error}, st}
+
+      # The last queued reply sticks (see stub_sequence/3's doc) rather than
+      # being popped away, so it is served repeatedly.
+      {:sequence, [reply]} ->
+        {reply_body(reply), st}
+
+      {:sequence, [reply | rest]} ->
+        {reply_body(reply), %{st | replies: Map.put(st.replies, method, {:sequence, rest})}}
+
+      nil ->
+        {%{"error" => %{"code" => "unstubbed", "message" => method}}, st}
+    end
+  end
+
+  defp reply_body({:result, result}), do: %{"result" => result}
+  defp reply_body({:error, error}), do: %{"error" => error}
 
   # Only the integer case is verified against the live server's exact
   # message text; other non-string types get a reasonable but unverified
