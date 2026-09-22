@@ -55,8 +55,7 @@ defmodule Hq.SessionSupTest do
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
 
-    assert eventually(fn -> Hq.Session.alive?("worker-a") end)
-    assert Hq.Session.info("worker-a")["mailbox"] == 1
+    assert eventually(fn -> match?({:ok, %{"mailbox" => 1}}, callable_info("worker-a")) end)
   end
 
   # A Session can legitimately be busy for up to 10s while it delivers a
@@ -92,5 +91,16 @@ defmodule Hq.SessionSupTest do
         {:cont, false}
       end
     end)
+  end
+
+  # `Hq.Session.alive?/1` only checks Registry, which briefly still holds a
+  # dead :transient restart's old pid until Registry processes its own DOWN.
+  # A call through the same :via tuple in that window exits :noproc even
+  # though alive? just answered true. Waiting on an actual successful call
+  # is the only way to know the name resolves to something that can answer.
+  defp callable_info(name) do
+    {:ok, Hq.Session.info(name)}
+  catch
+    :exit, _ -> :error
   end
 end
