@@ -71,6 +71,48 @@ defmodule Hq.SpawnerTest do
     assert wt["params"]["base"] == "main"
   end
 
+  # bdherd runs `tools/worktree-env.sh` against the NEWLY CREATED WORKTREE's
+  # path, not the source checkout it was ported from ($REPO/.worktree/$slug,
+  # not $REPO — see reference/bdherd.bash:203-206). A prior version of this
+  # module collapsed both to `cwd`, deriving compose ports for the base
+  # checkout instead of the worktree just created — silently defeating the
+  # entire reason this step exists. Every other test in this file passes
+  # `cwd` as a bare "/tmp/x" with no `tools/worktree-env.sh` under it, so
+  # `File.exists?` is always false and the script branch never runs; this is
+  # the only test that actually exercises it.
+  test "runs worktree-env.sh against the new worktree's path, not the source checkout",
+       %{fake: fake} do
+    checkout = Path.join(System.tmp_dir!(), "hq-checkout-#{System.unique_integer([:positive])}")
+    script = Path.join(checkout, "tools/worktree-env.sh")
+    File.mkdir_p!(Path.dirname(script))
+    File.write!(script, "#!/bin/sh\nexit 0\n")
+    File.chmod!(script, 0o755)
+    on_exit(fn -> File.rm_rf(checkout) end)
+
+    assert {:ok, _} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => checkout,
+               "worktree" => true,
+               "base" => "main"
+             })
+
+    expected_worktree_path = Path.join([checkout, ".worktree", "worker-a"])
+
+    # We also asked Herdr to create the worktree there in the first place.
+    assert call(fake, "worktree.create")["params"]["path"] == expected_worktree_path
+
+    script_calls =
+      FakeHerdr.calls(fake)
+      |> Enum.filter(&(&1["method"] == "pane.send_input"))
+      |> Enum.map(& &1["params"]["text"])
+      |> Enum.filter(&String.contains?(&1, "worktree-env.sh"))
+
+    assert [text] = script_calls
+    assert text == "#{script} #{expected_worktree_path} >/dev/null 2>&1 || true"
+  end
+
   test "clears stale credential env BEFORE starting the agent", %{fake: fake} do
     Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
@@ -128,7 +170,8 @@ defmodule Hq.SpawnerTest do
   end
 
   test "rejects a name already in use" do
-    Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+    assert {:ok, _} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
     assert {:error, %{"code" => "name_taken"}} =
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})

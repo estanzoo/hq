@@ -55,8 +55,8 @@ defmodule Hq.Spawner do
   defp do_spawn(name, args) do
     cwd = Map.get(args, "cwd")
 
-    with {:ok, pane_id} <- make_pane(name, args, cwd),
-         :ok <- prepare_env(pane_id, cwd),
+    with {:ok, pane_id, target_dir} <- make_pane(name, args, cwd),
+         :ok <- prepare_env(pane_id, cwd, target_dir),
          {:ok, _} <- start_agent(name, pane_id, args),
          {:ok, _pid} <- Hq.Roster.adopt(name, pane_id, cwd: cwd, spawned_by: args["from"]) do
       first_message(name, args)
@@ -74,7 +74,16 @@ defmodule Hq.Spawner do
     end
   end
 
+  # bdherd creates the worktree at a deterministic path under the source
+  # checkout ($REPO/.worktree/$slug) and later runs the env script AGAINST
+  # THAT PATH, not against $REPO. Mirror both halves here: compute (or take
+  # the caller's) target path, ask Herdr to create the worktree there, and
+  # hand that path — not `cwd` — back to the caller so prepare_env can point
+  # the script at the right directory.
   defp make_pane(name, %{"worktree" => true} = args, cwd) do
+    default_path = cwd && Path.join([cwd, ".worktree", name])
+    path = Map.get(args, "path", default_path)
+
     params =
       %{
         "branch" => "agent/#{name}",
@@ -83,12 +92,17 @@ defmodule Hq.Spawner do
         "focus" => false
       }
       |> maybe_put("cwd", cwd)
-      |> maybe_put("path", Map.get(args, "path"))
+      |> maybe_put("path", path)
 
     case Hq.Herdr.call("worktree.create", params) do
-      {:ok, %{"root_pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id}
-      {:ok, other} -> {:error, {:no_pane_in_response, other}}
-      error -> error
+      {:ok, %{"root_pane" => %{"pane_id" => pane_id}} = result} ->
+        {:ok, pane_id, worktree_path(result, path)}
+
+      {:ok, other} ->
+        {:error, {:no_pane_in_response, other}}
+
+      error ->
+        error
     end
   end
 
@@ -96,20 +110,37 @@ defmodule Hq.Spawner do
     params = %{"direction" => "right", "focus" => false} |> maybe_put("cwd", cwd)
 
     case Hq.Herdr.call("pane.split", params) do
-      {:ok, %{"pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id}
+      {:ok, %{"pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
       {:ok, other} -> {:error, {:no_pane_in_response, other}}
       error -> error
     end
   end
 
+  # Herdr's `worktree_created` response carries the authoritative location at
+  # `result.worktree.path` (`WorktreeInfo.path` is a required field per the
+  # API schema) — prefer it over what we asked for, since Herdr may adjust
+  # it. A spawn must not fail just because a response (or a test stub)
+  # happens to omit it, so fall back to the path we requested.
+  defp worktree_path(%{"worktree" => %{"path" => path}}, _requested) when is_binary(path),
+    do: path
+
+  defp worktree_path(_result, requested), do: requested
+
   # This monorepo derives per-checkout compose ports from the checkout directory
   # name; without this the new worktree's apps collide with every other
   # checkout's. Failure is not fatal — most repos have no such script.
-  defp prepare_env(pane_id, cwd) do
+  #
+  # The script itself always lives in the SOURCE checkout (`cwd`), but it
+  # must run AGAINST the directory the agent will actually work in
+  # (`target_dir`): for a plain pane.split those are the same directory, but
+  # for a worktree spawn they are not — running it against `cwd` instead of
+  # the new worktree derives ports for the wrong checkout and defeats the
+  # reason this step exists.
+  defp prepare_env(pane_id, cwd, target_dir) do
     script = cwd && Path.join(cwd, "tools/worktree-env.sh")
 
     if script && File.exists?(script) do
-      run(pane_id, "#{script} #{cwd} >/dev/null 2>&1 || true")
+      run(pane_id, "#{script} #{target_dir} >/dev/null 2>&1 || true")
     end
 
     run(pane_id, @unset)
