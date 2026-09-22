@@ -8,6 +8,7 @@ defmodule Hq.SpawnerTest do
     Application.put_env(:hq, :root, root)
     Application.put_env(:hq, :settle_ms, 10)
     Application.put_env(:hq, :pane_settle_ms, 1)
+    Application.put_env(:hq, :pane_poll_ms, 1)
     on_exit(fn -> File.rm_rf(root) end)
 
     start_supervised!({Registry, keys: :unique, name: Hq.Registry})
@@ -42,7 +43,34 @@ defmodule Hq.SpawnerTest do
       "root_pane" => %{"pane_id" => "w7:p1"}
     })
 
+    # A freshly split (or created) pane's shell is, by default in these
+    # tests, already past its own startup: exactly one foreground process,
+    # and it is the shell itself. Tests that care about the busy window
+    # override this stub explicitly.
+    FakeHerdr.stub(fake, "pane.process_info", ready_process_info(999))
+
     %{fake: fake}
+  end
+
+  defp ready_process_info(shell_pid) do
+    %{
+      "process_info" => %{
+        "foreground_processes" => [%{"name" => "zsh", "pid" => shell_pid}],
+        "shell_pid" => shell_pid
+      }
+    }
+  end
+
+  defp busy_process_info(shell_pid) do
+    %{
+      "process_info" => %{
+        "foreground_processes" => [
+          %{"name" => "path_helper", "pid" => shell_pid + 3},
+          %{"name" => "zsh", "pid" => shell_pid}
+        ],
+        "shell_pid" => shell_pid
+      }
+    }
   end
 
   defp methods(fake), do: FakeHerdr.calls(fake) |> Enum.map(& &1["method"])
@@ -246,5 +274,56 @@ defmodule Hq.SpawnerTest do
     starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
     assert length(starts) <= 10
     assert length(starts) > 1
+  end
+
+  # Immediately after pane.split/worktree.create, the shell is still running
+  # its own startup (.zprofile's path_helper, etc.) and reports more than one
+  # foreground process. hq must poll pane.process_info until the pane
+  # settles to just the shell before writing anything into it, rather than
+  # racing the shell's own prompt.
+  test "waits out a pane reported busy before it settles, then proceeds", %{fake: fake} do
+    FakeHerdr.stub_sequence(fake, "pane.process_info", [
+      {:ok, busy_process_info(999)},
+      {:ok, ready_process_info(999)}
+    ])
+
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert Hq.Session.alive?("worker-a")
+
+    checks = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "pane.process_info"))
+    assert length(checks) >= 2
+
+    starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
+    assert length(starts) == 1
+  end
+
+  # If the pane never settles, give up rather than writing into (or starting
+  # an agent against) a shell that may never be ready. This must be bounded,
+  # not an infinite poll, and must never reach agent.start.
+  test "gives up when the pane never becomes ready, and never calls agent.start", %{fake: fake} do
+    FakeHerdr.stub(fake, "pane.process_info", busy_process_info(999))
+
+    assert {:error, %{"code" => "spawn_failed", "message" => message}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert message =~ "pane_not_ready"
+    assert message =~ "w1:p2"
+    refute Hq.Session.alive?("worker-a")
+
+    starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
+    assert starts == []
+  end
+
+  test "checks the pane is ready before writing anything into it", %{fake: fake} do
+    Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    ms = methods(fake)
+    first_check = Enum.find_index(ms, &(&1 == "pane.process_info"))
+    first_input = Enum.find_index(ms, &(&1 == "pane.send_input"))
+
+    assert first_check < first_input,
+           "the pane's readiness must be checked before any input is written into it"
   end
 end

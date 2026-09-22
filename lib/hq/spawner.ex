@@ -28,6 +28,25 @@ defmodule Hq.Spawner do
   # sleeps, without ever blocking a pane that is already available.
   @pane_busy_attempts 8
 
+  # Herdr's pane.split / worktree.create returns as soon as the pane exists,
+  # not once its shell is usable: a fresh zsh still runs its own startup
+  # (.zprofile's path_helper, etc.) for roughly half a second afterwards. In
+  # that window `pane.process_info` reports more than one foreground
+  # process, and Herdr rightly refuses `agent.start` against the pane —
+  # empirically this is not a rare race, it is the first-spawn case every
+  # time. The pane_busy retry below (ported from the previous fix, kept as a
+  # backstop) treated this as a brief post-command busy window and retried
+  # agent.start blindly; it did not touch the real cause because the pane
+  # was never written to correctly in the first place — hq itself was
+  # sending prepare_env's commands into a shell that had not reached its
+  # prompt yet. Poll until the pane settles to exactly one foreground
+  # process — the shell itself — before writing anything into it at all,
+  # and again after prepare_env's commands (which briefly occupy the shell
+  # the same way) and before agent.start. 150 attempts at the default 100ms
+  # poll interval is a 15s worst-case budget; observed settle time against a
+  # real server was ~0.46s.
+  @pane_ready_attempts 150
+
   @spec spawn_agent(map()) :: {:ok, map()} | {:error, map()}
   def spawn_agent(%{"name" => name} = args) do
     cond do
@@ -78,7 +97,9 @@ defmodule Hq.Spawner do
     cwd = Map.get(args, "cwd")
 
     with {:ok, pane_id, target_dir} <- make_pane(name, args, cwd),
+         :ok <- wait_for_shell(pane_id),
          :ok <- prepare_env(pane_id, cwd, target_dir),
+         :ok <- wait_for_shell(pane_id),
          {:ok, _} <- start_agent(name, pane_id, args),
          {:ok, _pid} <- Hq.Roster.adopt(name, pane_id, cwd: cwd, spawned_by: args["from"]) do
       first_message(name, args)
@@ -167,6 +188,46 @@ defmodule Hq.Spawner do
 
     run(pane_id, @unset)
   end
+
+  # Polls pane.process_info until the pane's only foreground process is its
+  # own shell, i.e. it has reached an interactive prompt and is safe to
+  # write into or hand to agent.start. Bounded by @pane_ready_attempts *
+  # pane_poll_ms; on exhaustion this returns an error (never raises, never
+  # loops forever) so the caller can fail the spawn cleanly instead of
+  # writing into — or starting an agent against — a shell that may never
+  # settle.
+  defp wait_for_shell(pane_id), do: wait_for_shell(pane_id, @pane_ready_attempts)
+
+  defp wait_for_shell(pane_id, 0) do
+    {:error,
+     %{
+       "code" => "pane_not_ready",
+       "message" => "pane #{pane_id} never reached an idle shell prompt"
+     }}
+  end
+
+  defp wait_for_shell(pane_id, attempts_left) do
+    if pane_shell_ready?(pane_id) do
+      :ok
+    else
+      Process.sleep(pane_poll_ms())
+      wait_for_shell(pane_id, attempts_left - 1)
+    end
+  end
+
+  # The repeated `pid` variable is intentional: a single Elixir pattern
+  # requires every occurrence of the same variable to match the same value,
+  # so this is true only when the pane's foreground process list holds
+  # exactly one entry and that entry's pid is the shell's own pid — not two
+  # separately-checked conditions but one structural match.
+  defp pane_shell_ready?(pane_id) do
+    match?(
+      {:ok, %{"process_info" => %{"foreground_processes" => [%{"pid" => pid}], "shell_pid" => pid}}},
+      Hq.Herdr.call("pane.process_info", %{"pane_id" => pane_id})
+    )
+  end
+
+  defp pane_poll_ms, do: Application.get_env(:hq, :pane_poll_ms, 100)
 
   defp run(pane_id, text) do
     case Hq.Herdr.call("pane.send_input", %{
