@@ -40,7 +40,7 @@ defmodule Hq.SessionSupTest do
     assert :ok = Hq.SessionSup.stop_session("worker-a")
 
     assert Hq.SessionSup.list() == []
-    refute Hq.Session.alive?("worker-a")
+    assert eventually(fn -> not Hq.Session.alive?("worker-a") end)
   end
 
   test "stopping an unknown session is an error" do

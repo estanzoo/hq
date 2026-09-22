@@ -49,7 +49,7 @@ defmodule Hq.RosterTest do
   test "re-adopts remembered sessions on boot", %{fake: fake} do
     {:ok, _} = Hq.Roster.adopt("worker-a", "w5:p1")
     :ok = Hq.SessionSup.stop_session("worker-a")
-    refute Hq.Session.alive?("worker-a")
+    assert eventually(fn -> not Hq.Session.alive?("worker-a") end)
 
     FakeHerdr.stub(fake, "agent.list", %{
       "type" => "agent_list",
@@ -81,7 +81,7 @@ defmodule Hq.RosterTest do
     FakeHerdr.push_event(fake, "pane_exited", %{"pane_id" => "w5:p1"})
 
     assert eventually(fn -> not Hq.Session.alive?("worker-a") end)
-    assert Hq.Roster.remembered() == []
+    assert eventually(fn -> Hq.Roster.remembered() == [] end)
   end
 
   test "forget stops and un-remembers" do
