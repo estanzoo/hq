@@ -212,6 +212,45 @@ defmodule Hq.SpawnerTest do
     assert body =~ "implement the parser"
   end
 
+  # I5: `preamble/1` used to say only "you can message any other live
+  # session" -- a worker learned who its parent was solely from free-text an
+  # orchestrator happened to write into `--task`. Drive this through a real
+  # spawn (not a hand-written preamble string) so a regression that stops
+  # wiring `args["from"]` through to the preamble cannot hide behind a test
+  # that constructs the expected text itself.
+  test "preamble names the actual resolved parent, not just a peer notice" do
+    Hq.Spawner.spawn_agent(%{
+      "name" => "worker-a",
+      "from" => "boss",
+      "cwd" => "/tmp/x"
+    })
+
+    pending = Hq.Session.pending("worker-a")
+    body = pending |> Enum.map(& &1["body"]) |> Enum.join("\n")
+
+    assert body =~ "You were spawned by `boss`"
+    assert body =~ "hq send boss"
+  end
+
+  # "operator" is `Hq.Control.Handler.resolve_from/1`'s fallback when the
+  # spawning pane has no supervised hq session of its own -- there is no
+  # session actually named "operator" to `hq send`, so telling a worker to
+  # message it would just produce an unknown_target error the worker cannot
+  # recover from on its own.
+  test "preamble tells a directly-spawned worker the operator is not an addressable session" do
+    Hq.Spawner.spawn_agent(%{
+      "name" => "worker-a",
+      "from" => "operator",
+      "cwd" => "/tmp/x"
+    })
+
+    pending = Hq.Session.pending("worker-a")
+    body = pending |> Enum.map(& &1["body"]) |> Enum.join("\n")
+
+    assert body =~ "not an addressable hq session"
+    refute body =~ "hq send operator"
+  end
+
   test "rejects a name Herdr will not accept" do
     assert {:error, %{"code" => "bad_name"}} =
              Hq.Spawner.spawn_agent(%{"name" => "Worker A", "from" => "boss"})

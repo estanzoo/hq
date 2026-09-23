@@ -149,6 +149,24 @@ defmodule Hq.ControlTest do
              request("register", %{"name" => "Worker A", "pane_id" => "w1:p1"})
   end
 
+  # `register` on a taken name used to return `%{"code" => "name_taken",
+  # "message" => name}` -- the CLI renders `error["message"]` verbatim, so a
+  # second orchestrator saw exactly `hq: orchestrator`, naming neither the
+  # conflict nor the remedy. It must now name the conflict, the pane already
+  # holding the name, and the fix -- asserted on content, not just the code,
+  # so a regression back to the bare name cannot hide behind the code check
+  # alone.
+  test "register on a taken name explains the conflict, who holds it, and the remedy" do
+    {:ok, _} = Hq.Roster.adopt("orchestrator", "w1:p1")
+
+    assert %{"ok" => false, "error" => %{"code" => "name_taken", "message" => message}} =
+             request("register", %{"name" => "orchestrator", "pane_id" => "w2:p1"})
+
+    assert message =~ "`orchestrator` is already registered"
+    assert message =~ "w1:p1"
+    assert message =~ "Pick a different name"
+  end
+
   test "an unknown verb is an error, not a hang" do
     assert %{"ok" => false, "error" => %{"code" => "unknown_verb"}} = request("frobnicate", %{})
   end

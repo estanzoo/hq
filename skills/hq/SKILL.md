@@ -19,13 +19,46 @@ test -n "${HERDR_PANE_ID:-}" && hq ls
 If `HERDR_PANE_ID` is unset you are not in a Herdr-managed pane; say so and
 stop.
 
-## Register yourself first
+## Naming: register yourself first
 
-```bash
-hq register orchestrator
+hq names are **global to the machine**, not per-orchestrator — one daemon is
+shared by every session in every Herdr pane. Two orchestrators running at once
+cannot share a name, and if you register one another live orchestrator holds,
+`hq register` fails. The fix is to pick a different name, never to proceed
+unregistered: an unregistered orchestrator is unaddressable, so its workers
+cannot report back to it.
+
+**The convention, which keeps every name in a run self-identifying:**
+
+- **Orchestrator** — a shortened form of the epic you are running. Strip the
+  `plan-` prefix and the random suffix, then shorten what is left until it is
+  recognisable but brief.
+- **Workers** — the orchestrator's name plus a suffix identifying which agent
+  it is. Use the bead it implements when there is one, so a name says both
+  which run it belongs to and which task it holds.
+
+```
+epic          plan-custom-actions-ingress-y2w
+orchestrator  ca-ingress
+workers       ca-ingress-1   ca-ingress-3   ca-ingress-4
 ```
 
-This names your pane so peers can address you. Do it before spawning anyone.
+```bash
+hq register ca-ingress
+hq spawn ca-ingress-1 --worktree --base main --cwd "$PWD" --task "..."
+```
+
+Two constraints to respect when you shorten:
+
+- A name must match `[a-z][a-z0-9_-]{0,31}` — **32 characters**. The suffix
+  has to fit too, so keep the orchestrator name to roughly 20 characters or
+  fewer. `ca-ingress` leaves plenty; `custom-actions-ingress` leaves almost
+  none.
+- Names must be unique among *live* agents only. A finished run frees its
+  names, so you may reuse a slug once its sessions are gone.
+
+Register before spawning anyone. If it fails with `name_taken`, the error
+names what currently holds it — shorten differently and register again.
 
 ## Running an epic
 
@@ -58,8 +91,8 @@ You own all the policy. `hq` only moves messages and starts agents.
    Independent tasks, in parallel:
 
    ```bash
-   hq spawn worker-a --worktree --base main --cwd "$PWD" \
-     --task "Implement <task>. Commit to your branch. Do not push."
+   hq spawn ca-ingress-1 --worktree --base main --cwd "$PWD" \
+     --task "Implement <bead>. Commit to your branch. Do not push."
    ```
 
    Ordered tasks sharing a branch — spawn them **sequentially into the same
@@ -70,12 +103,12 @@ You own all the policy. `hq` only moves messages and starts agents.
 
    ```bash
    # first task creates the worktree and the branch
-   hq spawn worker-1 --worktree --base main --cwd "$PWD" \
+   hq spawn ca-ingress-1 --worktree --base main --cwd "$PWD" \
      --task "Implement <bead .1> ONLY. Commit to this branch. Do not push."
 
-   # ... wait for worker-1 to report, then:
-   hq release worker-1
-   hq spawn worker-3 --cwd "<that worktree path>" \
+   # ... wait for ca-ingress-1 to report, then:
+   hq release ca-ingress-1
+   hq spawn ca-ingress-3 --cwd "<that worktree path>" \
      --task "Implement <bead .3> ONLY. Commit to this branch. Do not push."
    ```
 
@@ -95,10 +128,16 @@ You own all the policy. `hq` only moves messages and starts agents.
 5. Workers message you and each other as they go. Their mail is typed into
    your session prefixed `[hq]`, which wakes you.
 
+   Each worker is told its parent by the spawn preamble itself (`hq send
+   <name-you-registered> "<message>"`) — you don't need to spell out "report
+   to `<your-name>`" in `--task`. Don't tell a worker to message "orchestrator"
+   by that literal name; it should address whatever name you actually
+   registered, which the preamble already gave it.
+
 ## Messaging
 
 ```bash
-hq send worker-b "the schema is frozen: users.id is uuid"
+hq send ca-ingress-3 "the schema is frozen: users.id is uuid"
 hq ls        # who is live, their status, how much mail is queued
 hq inbox     # what is queued for you
 ```
@@ -109,6 +148,7 @@ it goes idle. Tell peers what you have decided rather than waiting to be asked.
 ## Rules
 
 - Names must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents.
+  Orchestrator = shortened epic name; worker = that name plus a task suffix.
 - `hq` never answers an approval dialog. If `hq ls` shows a worker `blocked`,
   look at it with `herdr agent read <name> --source detection` and ask the user.
 - `--permissive` starts a worker with permissions skipped. Use it only when the

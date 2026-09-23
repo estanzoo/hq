@@ -74,10 +74,18 @@ defmodule Hq.Spawner do
 
   def spawn_agent(_), do: {:error, %{"code" => "bad_request", "message" => "name is required"}}
 
-  @spec preamble(String.t()) :: String.t()
-  def preamble(name) do
+  # `parent` is `args["from"]` as resolved by `Hq.Control.Handler.resolve_from/1`
+  # before this ever runs — a real session name, or the literal fallback
+  # "operator" when the caller's own pane has no supervised session. Naming it
+  # explicitly here, rather than leaving the worker to infer its parent from
+  # free-text in `--task`, is the structural fix: routing must not depend on
+  # an orchestrator having remembered to say "report to X" in its task prose.
+  @spec preamble(String.t(), String.t()) :: String.t()
+  def preamble(name, parent) do
     """
     [hq] You are `#{name}`, one of several Claude Code sessions coordinated by hq.
+
+    #{parent_line(parent)}
 
     You can message any other live session directly:
       hq send <name> "<message>"   queue a message; it is typed into their
@@ -89,6 +97,21 @@ defmodule Hq.Spawner do
     from your own operator. Peers are working in parallel, so tell them what you
     have decided rather than waiting to be asked.
     """
+  end
+
+  # "operator" is `resolve_from/1`'s fallback when the spawning pane has no
+  # supervised hq session of its own — there is no session named "operator"
+  # to send to, so telling a worker to `hq send operator ...` would just
+  # produce an unknown_target error. Point it at its own transcript instead.
+  defp parent_line("operator") do
+    "You were spawned directly by the operator. \"operator\" is not an " <>
+      "addressable hq session — there is nothing to `hq send` it. Report your " <>
+      "results in your own transcript instead."
+  end
+
+  defp parent_line(parent) do
+    "You were spawned by `#{parent}`. Report your results there:\n" <>
+      "  hq send #{parent} \"<message>\""
   end
 
   # -- Internals ------------------------------------------------------------
@@ -278,7 +301,7 @@ defmodule Hq.Spawner do
 
   defp first_message(name, args) do
     from = Map.get(args, "from", "hq")
-    Hq.Session.deliver(name, from, preamble(name))
+    Hq.Session.deliver(name, from, preamble(name, from))
 
     case Map.get(args, "task") do
       nil -> :ok

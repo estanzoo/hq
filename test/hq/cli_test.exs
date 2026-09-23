@@ -524,6 +524,39 @@ defmodule Hq.CLITest do
     assert Hq.CLI.render("ls", %{"sessions" => [session]}) =~ "mail:3"
   end
 
+  test "ls renders the parent a session was spawned by" do
+    session = %{
+      "name" => "worker-a",
+      "pane_id" => "w1:p1",
+      "cwd" => "/tmp",
+      "status" => "idle",
+      "spawned_by" => "boss",
+      "mailbox" => 0
+    }
+
+    assert Hq.CLI.render("ls", %{"sessions" => [session]}) =~ "boss"
+  end
+
+  # `Hq.Session.info/1` already returns "spawned_by" => nil for a session
+  # registered directly rather than spawned; a naive renderer that just
+  # interpolates the field (`"#{s["spawned_by"]}"`) would print the literal
+  # word "nil" in the parent column, indistinguishable from a session
+  # actually named that.
+  test "ls renders a session with no parent as blank/'-', not the word nil" do
+    session = %{
+      "name" => "orchestrator",
+      "pane_id" => "w1:p1",
+      "cwd" => "/tmp",
+      "status" => "idle",
+      "spawned_by" => nil,
+      "mailbox" => 0
+    }
+
+    line = Hq.CLI.render("ls", %{"sessions" => [session]})
+    refute line =~ "nil"
+    assert line =~ ~r/\s-\s/
+  end
+
   test "ls with no sessions" do
     assert Hq.CLI.render("ls", %{"sessions" => []}) == "no live sessions"
   end

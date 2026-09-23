@@ -373,11 +373,12 @@ defmodule Hq.CLI do
 
   def render("ls", %{"sessions" => sessions}) do
     Enum.map_join(sessions, "\n", fn s ->
-      :io_lib.format("~-20s ~-8s mail:~-3s ~s", [
+      :io_lib.format("~-20s ~-8s mail:~-3s ~-14s ~s", [
         s["name"],
         s["status"],
         mailbox_label(s["mailbox"]),
-        s["cwd"] || ""
+        parent_label(s["spawned_by"]),
+        elide_cwd(s["cwd"])
       ])
       |> to_string()
       |> String.trim_trailing()
@@ -401,6 +402,32 @@ defmodule Hq.CLI do
   defp mailbox_label(nil), do: "?"
   defp mailbox_label(n) when is_integer(n), do: Integer.to_string(n)
 
+  # A session `hq register`ed directly (not spawned by another session) has
+  # no `spawned_by`. Rendering `nil` (via plain string interpolation, e.g.
+  # `"#{nil}"`) would print the literal word "nil" in the parent column,
+  # indistinguishable from a session actually named that; render blank/"-"
+  # instead so an unparented session is unambiguous at a glance.
+  defp parent_label(nil), do: "-"
+  defp parent_label(parent), do: parent
+
+  # `cwd` is the one field here with no natural bound (a deep worktree path
+  # can run well past a terminal's width and wrap the whole `hq ls` table).
+  # Every other column is fixed-width; keep this one readable by eliding the
+  # middle of a long path rather than letting it push (or wrap) everything
+  # after it.
+  @cwd_width 40
+
+  defp elide_cwd(nil), do: ""
+
+  defp elide_cwd(cwd) do
+    if String.length(cwd) <= @cwd_width do
+      cwd
+    else
+      keep = div(@cwd_width - 1, 2)
+      String.slice(cwd, 0, keep) <> "…" <> String.slice(cwd, -keep, keep)
+    end
+  end
+
   defp usage(code) do
     IO.puts("""
     hq — message bus for Claude Code sessions in Herdr panes
@@ -410,7 +437,7 @@ defmodule Hq.CLI do
           --worktree --base <ref> --cwd <path> --kind <kind>
           --task "<text>" --permissive
       hq send <name> "<message>"      queue a message; delivered when idle
-      hq ls                           live sessions, status, mailbox depth
+      hq ls                           live sessions, status, mailbox depth, parent
       hq inbox                        what is queued for this pane
       hq release <name>               stop supervising (does not kill the agent)
       hq daemon                       run the daemon in the foreground

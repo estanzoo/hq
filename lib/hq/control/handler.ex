@@ -87,7 +87,7 @@ defmodule Hq.Control.Handler do
          }}
 
       Hq.Session.alive?(name) ->
-        {:error, %{"code" => "name_taken", "message" => name}}
+        {:error, %{"code" => "name_taken", "message" => name_taken_message(name)}}
 
       true ->
         with {:ok, _} <- Hq.Herdr.call("agent.rename", %{"target" => pane_id, "name" => name}),
@@ -107,6 +107,29 @@ defmodule Hq.Control.Handler do
   end
 
   defp live_names, do: Hq.SessionSup.list() |> Enum.map(& &1["name"]) |> Enum.sort()
+
+  # `register` on a taken name used to return `%{"code" => "name_taken",
+  # "message" => name}` -- the CLI renders `error["message"]` verbatim, so a
+  # second orchestrator trying to register the same name as a first saw
+  # exactly `hq: orchestrator`, naming neither the conflict nor the remedy.
+  # It has no way to tell "orchestrator" is taken from that alone, so it
+  # proceeds unregistered while its own workers keep addressing a name that
+  # routes to someone else's session. Name the conflict, the pane holding it
+  # (when that's cheap -- one more GenServer.call against a session we just
+  # confirmed alive), and the fix: pick a different name.
+  defp name_taken_message(name) do
+    "`#{name}` is already registered#{held_by(name)}.\n" <>
+      "     hq names are global to this machine, not per-orchestrator -- two " <>
+      "orchestrators running at once must not share one.\n" <>
+      "     Pick a different name and register again."
+  end
+
+  defp held_by(name) do
+    case Hq.Session.info(name)["pane_id"] do
+      pane_id when is_binary(pane_id) -> " (held by pane #{pane_id})"
+      _ -> ""
+    end
+  end
 
   # A session name (`@name_re`) never contains `:`; a Herdr pane id always
   # does (e.g. "w1:p1"), so the two are never ambiguous. Anything already
