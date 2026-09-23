@@ -1,5 +1,12 @@
-_build/
-deps/
+# Build artifacts
+/_build/
+/deps/
+/cover/
 *.ez
-hq
+erl_crash.dump
+
+# The escript built by `mix escript.build` (anchored: skills/hq must not match)
+/hq
+
+# Editor / language server
 .elixir_ls/
