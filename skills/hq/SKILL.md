@@ -10,6 +10,15 @@ Messages are queued and typed into the target session's visible I/O when it
 next goes idle, so an arriving message is also the target's wakeup. `hq`
 autostarts its own daemon on first use — you never start it by hand.
 
+`hq stop` and `hq restart` exist for the rare case the daemon itself needs to
+come down (usually: picking up a new build after `./install.sh`, which does
+NOT reload a daemon that is already running). `hq stop` asks the daemon to
+shut itself down over its own control socket; never reach for `pkill` or
+`killall` here — matching a running process by a command-line pattern across
+the whole machine is exactly what has previously killed unrelated terminal
+sessions and editor processes that merely shared a substring with the
+daemon's own invocation.
+
 ## Check you can use it
 
 ```bash
@@ -154,6 +163,9 @@ it goes idle. Tell peers what you have decided rather than waiting to be asked.
 - `--permissive` starts a worker with permissions skipped. Use it only when the
   user has asked for an unattended run.
 - `hq release <name>` stops supervising a session; it does not kill the agent.
+- `hq stop` / `hq restart` stop or restart the daemon itself -- never `pkill`
+  or `killall` it. After `./install.sh`, `hq restart` is required for an
+  already-running daemon to pick up the new build.
 - One task per agent by default. Batching tasks into one agent accumulates
   context across them and makes a single wedge lose the whole chain.
 - There is no branch merging. For work that shares files, prefer sequential

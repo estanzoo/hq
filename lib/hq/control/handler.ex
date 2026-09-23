@@ -102,6 +102,49 @@ defmodule Hq.Control.Handler do
 
   defp do_handle(%{"verb" => "spawn", "args" => args}), do: Hq.Spawner.spawn_agent(args)
 
+  # `hq stop`'s primary, signal-free path -- see the module doc on
+  # `Hq.Control` for why `pkill -f 'hq daemon'` (the old advice) is
+  # dangerous: it matches every process's full command line, not just the
+  # daemon's. This verb lets the CLI ask the daemon it can actually reach
+  # (over its own control socket) to shut itself down, no signal involved.
+  #
+  # The reply MUST reach the caller before the daemon goes down, or the CLI
+  # sees a closed socket instead of a confirmation -- indistinguishable from
+  # the daemon having simply crashed. `Hq.Control.serve/1` calls
+  # `reply(sock, dispatch(req))`: whatever this function returns becomes the
+  # bytes written to the socket, and that write happens strictly AFTER this
+  # function returns. So the actual shutdown trigger runs in a SEPARATE,
+  # freshly spawned process, after a short delay -- never inline, in the
+  # process that still has to write the reply. Calling `stop_fun` directly
+  # here, in this process, would race full application shutdown against that
+  # very `:gen_tcp.send`: if shutdown reached this process first, the reply
+  # would never go out.
+  #
+  # `:init.stop/0` (never `System.halt/1`) is what actually runs -- it drives
+  # ordinary application shutdown, so `Hq.Control.terminate/2` executes and
+  # cleans up the socket and `daemon.pid` exactly as it does on any other
+  # controlled stop. `System.halt/1` skips every `terminate/2` callback and
+  # would leave both files behind.
+  #
+  # Both the delay and the trigger itself are configurable via
+  # `Application.get_env(:hq, :stop_delay_ms | :stop_fun, ...)` purely so
+  # tests can swap in a harmless stand-in instead of tearing down the whole
+  # test VM -- config/test.exs pins a no-op default as a safety net.
+  @stop_delay_ms 100
+
+  defp do_handle(%{"verb" => "stop"}) do
+    pid = System.pid()
+    delay = Application.get_env(:hq, :stop_delay_ms, @stop_delay_ms)
+    stop_fun = Application.get_env(:hq, :stop_fun, &:init.stop/0)
+
+    spawn(fn ->
+      Process.sleep(delay)
+      stop_fun.()
+    end)
+
+    {:ok, %{"pid" => pid, "stopping" => true}}
+  end
+
   defp do_handle(%{"verb" => verb}) do
     {:error, %{"code" => "unknown_verb", "message" => to_string(verb)}}
   end

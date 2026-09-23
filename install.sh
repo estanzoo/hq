@@ -33,3 +33,7 @@ cat <<'JSON'
 JSON
 echo
 echo "hq needs a running Herdr server. Start one with 'herdr' in a terminal."
+echo
+echo "If a daemon from a previous build is still running, it will keep serving"
+echo "that OLD build -- it does not reload itself. Run 'hq restart' to have it"
+echo "pick up what was just installed (safe: never pkill/killall, signal-verified)."

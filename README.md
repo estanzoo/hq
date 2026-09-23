@@ -36,8 +36,23 @@ hq send <name> "<message>"      queue a message; delivered when idle
 hq ls                           live sessions, status, mailbox depth
 hq inbox                        what is queued for this pane
 hq release <name>               stop supervising (does not kill the agent)
+hq stop                         stop the daemon (safe; never pkill/killall)
+hq restart                      stop the daemon, then start a fresh one
 hq daemon                       run the daemon in the foreground
 ```
+
+`./install.sh` rebuilds the escript but does not touch a daemon already
+running -- it keeps serving the OLD build until you `hq restart`. Run that
+after every install/update where a daemon might already be up.
+
+`hq stop` asks the daemon to shut itself down over its own control socket
+first; that is the only path used unless the socket does not answer, in
+which case it falls back to signalling the daemon's pid directly -- and only
+after confirming, via that pid's own command line, that it actually belongs
+to hq. It never uses `pkill` or `killall`: matching by command-line pattern
+across every process on the machine is exactly what those do, and exactly
+what previously took down unrelated terminal sessions and editor processes
+that merely happened to share a substring with the daemon's invocation.
 
 The `skills/hq/` directory installs as a Claude Code skill so an orchestrating
 session can read the workflow itself — see `skills/hq/SKILL.md`.

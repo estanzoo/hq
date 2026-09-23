@@ -275,6 +275,41 @@ defmodule Hq.ControlTest do
     assert File.read!(pid_path) == "999999"
   end
 
+  # -- stop -------------------------------------------------------------------
+  #
+  # The whole point of writing the reply before shutting down: `hq stop` must
+  # see a well-formed confirmation, not a closed socket indistinguishable
+  # from a crash. `Application.put_env(:hq, :stop_fun, ...)` swaps in a
+  # harmless stand-in (send a message) instead of the real `:init.stop/0`,
+  # which would halt this entire test VM -- config/test.exs already pins a
+  # no-op default for every OTHER test for exactly that reason.
+  #
+  # This proves ORDER, not just that a reply eventually arrives: the
+  # assertion right after the reply is a `refute_received` (checks the
+  # mailbox as it stands right now, no waiting), so if `stop_fun` had
+  # already run by the time the reply was received, this would catch it.
+  # Correct code schedules the trigger on a separate process, delayed
+  # `stop_delay_ms` past when the reply was already written to the socket,
+  # so nothing is in the mailbox yet at that point -- but `stop_fun` does
+  # still eventually run (`assert_receive` below), proving the mechanism
+  # isn't dead code either.
+  test "stop replies with a well-formed ok envelope, pid included, before the shutdown trigger runs" do
+    test_pid = self()
+    Application.put_env(:hq, :stop_fun, fn -> send(test_pid, :would_stop) end)
+    Application.put_env(:hq, :stop_delay_ms, 200)
+
+    on_exit(fn ->
+      Application.put_env(:hq, :stop_fun, fn -> :ok end)
+      Application.delete_env(:hq, :stop_delay_ms)
+    end)
+
+    assert %{"ok" => true, "result" => %{"pid" => pid}} = request("stop", %{})
+    assert pid == System.pid()
+
+    refute_received :would_stop
+    assert_receive :would_stop, 1_000
+  end
+
   defp eventually(fun, tries \\ 50) do
     Enum.reduce_while(1..tries, false, fn _, _ ->
       if fun.() do

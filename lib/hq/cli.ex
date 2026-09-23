@@ -28,6 +28,8 @@ defmodule Hq.CLI do
       ["-h" | _] -> usage(0)
       ["--help" | _] -> usage(0)
       ["daemon" | _] -> run_daemon()
+      ["stop" | _] -> run_stop()
+      ["restart" | _] -> run_restart()
       _ -> run_verb(argv)
     end
   end
@@ -267,6 +269,267 @@ defmodule Hq.CLI do
     end
   end
 
+  # -- stop / restart --------------------------------------------------------
+  #
+  # This exists so nobody ever has to reach for `pkill -f 'hq daemon'` again.
+  # `pkill -f` matches a pattern against every process's FULL COMMAND LINE on
+  # the whole machine, not just the daemon's -- the exact form of that advice
+  # once took down a live machine (terminal shells, editor helpers and
+  # Electron processes whose arguments happened to contain the string all
+  # died alongside the daemon). Nothing below ever searches the process
+  # table by pattern: the primary path asks the daemon to stop itself over
+  # the socket it already answers on, and the signal fallback only ever acts
+  # on a pid it has independently verified is genuinely hq's.
+
+  @socket_gone_tries 100
+  @socket_gone_poll_ms 20
+
+  @spec stop_daemon() ::
+          {:stopped, String.t(), :socket | :socket_unconfirmed | :signal}
+          | {:no_daemon, String.t()}
+          | {:refused, String.t()}
+  def stop_daemon do
+    # A raw request, not `request/2`: `request/2` calls `ensure_daemon/0`
+    # first, which AUTOSTARTS a daemon when none answers -- exactly wrong for
+    # `hq stop`, which must never bring up a daemon just to immediately stop
+    # it. Failing to connect here means either nothing is listening, or
+    # something is there but not answering; either way the signal fallback
+    # (which does its own from-scratch liveness check) is what decides next,
+    # not an autostart.
+    case raw_request("stop", %{}) do
+      {:ok, %{"pid" => pid}} ->
+        case wait_for_socket_gone() do
+          :ok -> {:stopped, pid, :socket}
+          :timeout -> {:stopped, pid, :socket_unconfirmed}
+        end
+
+      {:error, _reason} ->
+        case attempt_signal_stop() do
+          {:ok, pid} -> {:stopped, pid, :signal}
+          {:no_daemon, _} = result -> result
+          {:refused, _} = result -> result
+        end
+    end
+  end
+
+  # `starter` defaults to the real `ensure_daemon/0` and exists only so a
+  # test can substitute a fake that writes a distinguishable pid to
+  # `Hq.Control.pid_path/0` without shelling out to a real second `hq`
+  # process -- `restart_daemon/1`'s own job (stop, then read whatever pid
+  # ends up on disk) is exercised for real either way.
+  @spec restart_daemon((-> :ok | {:error, term()})) ::
+          {:restarted, String.t() | nil, String.t() | nil}
+          | {:restart_failed, String.t() | nil, term()}
+          | {:refused, String.t()}
+  def restart_daemon(starter \\ &ensure_daemon/0) do
+    case stop_daemon() do
+      {:refused, _message} = refused ->
+        refused
+
+      stop_result ->
+        old_pid =
+          case stop_result do
+            {:stopped, pid, _via} -> pid
+            _ -> nil
+          end
+
+        case starter.() do
+          :ok -> {:restarted, old_pid, read_daemon_pid()}
+          {:error, reason} -> {:restart_failed, old_pid, reason}
+        end
+    end
+  end
+
+  # Verifies a pid actually belongs to hq before anything is ever signalled.
+  # Public so a test can drive it directly against a real (but disposable,
+  # test-owned) process rather than only indirectly through `stop_daemon/0`.
+  @spec verify_hq_daemon(String.t()) ::
+          {:ok, String.t()} | {:error, :not_running} | {:error, :not_hq, String.t()}
+  def verify_hq_daemon(pid) do
+    case os_process_command(pid) do
+      nil ->
+        {:error, :not_running}
+
+      command ->
+        if hq_daemon_command?(command), do: {:ok, command}, else: {:error, :not_hq, command}
+    end
+  end
+
+  # The signal fallback: only reached once the control socket has already
+  # failed to answer `stop`. Reads the pid `Hq.Control`'s own `init/1` wrote
+  # (see `pid_path/0`'s moduledoc), then refuses outright unless that exact
+  # pid's own command line checks out -- a stale pid file whose number has
+  # since been reused by an unrelated process must never be signalled, and
+  # neither must an absent or already-dead one (both just mean no daemon is
+  # running, not an error).
+  @spec attempt_signal_stop() ::
+          {:ok, String.t()} | {:no_daemon, String.t()} | {:refused, String.t()}
+  defp attempt_signal_stop do
+    pid_path = Hq.Control.pid_path()
+
+    case File.read(pid_path) do
+      {:error, _} ->
+        {:no_daemon, "no daemon is running"}
+
+      {:ok, contents} ->
+        pid = String.trim(contents)
+
+        case verify_hq_daemon(pid) do
+          {:error, :not_running} ->
+            {:no_daemon, "no daemon is running (stale pid file for pid #{pid} at #{pid_path})"}
+
+          {:error, :not_hq, command} ->
+            {:refused,
+             "pid #{pid} (from #{pid_path}) does not look like an hq daemon " <>
+               "(command: #{inspect(command)}) -- refusing to signal it. If this pid is " <>
+               "something else entirely, remove #{pid_path} by hand; do not signal it " <>
+               "yourself by pid or pattern."}
+
+          {:ok, _command} ->
+            signal_fun().(pid)
+            {:ok, pid}
+        end
+    end
+  end
+
+  @spec os_process_command(String.t()) :: String.t() | nil
+  defp os_process_command(pid) do
+    case System.cmd("ps", ["-p", pid, "-o", "command="], stderr_to_stdout: true) do
+      {output, 0} ->
+        case String.trim(output) do
+          "" -> nil
+          command -> command
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  # Both conditions must hold: the command line must name "daemon" (the one
+  # argument every real `hq daemon` process runs with) AND look like hq
+  # itself, either by containing the exact executable this CLI would itself
+  # resolve to, or by having "hq" as a bare path component / leading word --
+  # loose enough to survive PATH differing slightly between when the daemon
+  # was started and when it is being stopped, without matching some
+  # unrelated process that merely mentions "daemon" somewhere in its args.
+  @spec hq_daemon_command?(String.t()) :: boolean()
+  defp hq_daemon_command?(command) do
+    String.contains?(command, "daemon") and
+      (String.contains?(command, hq_executable()) or
+         Regex.match?(~r{(^|/)hq(\s|$)}, command))
+  end
+
+  defp hq_executable do
+    System.find_executable("hq") ||
+      try do
+        :escript.script_name() |> to_string()
+      rescue
+        _ -> "hq"
+      end
+  end
+
+  defp signal_fun, do: Application.get_env(:hq, :signal_fun, &default_signal/1)
+
+  defp default_signal(pid), do: System.cmd("kill", [pid], stderr_to_stdout: true)
+
+  defp read_daemon_pid do
+    case File.read(Hq.Control.pid_path()) do
+      {:ok, contents} -> String.trim(contents)
+      _ -> nil
+    end
+  end
+
+  defp wait_for_socket_gone(tries \\ @socket_gone_tries) do
+    cond do
+      tries <= 0 ->
+        :timeout
+
+      not File.exists?(Hq.Control.socket_path()) ->
+        :ok
+
+      true ->
+        Process.sleep(@socket_gone_poll_ms)
+        wait_for_socket_gone(tries - 1)
+    end
+  end
+
+  # A raw request bypassing `request/2`'s `ensure_daemon/0` autostart -- see
+  # `stop_daemon/0` for why that matters here. Otherwise identical to
+  # `request/2`'s own send/recv/decode, including its socket handling.
+  defp raw_request(verb, args) do
+    case connect() do
+      {:ok, sock} ->
+        try do
+          with :ok <-
+                 :gen_tcp.send(sock, [JSON.encode!(%{"verb" => verb, "args" => args}), ?\n]),
+               {:ok, line} <- :gen_tcp.recv(sock, 0, request_timeout_ms()) do
+            case JSON.decode(line) do
+              {:ok, %{"ok" => true, "result" => result}} -> {:ok, result}
+              {:ok, %{"ok" => false, "error" => error}} -> {:error, error}
+              _ -> {:error, %{"code" => "bad_response", "message" => line}}
+            end
+          else
+            {:error, reason} -> {:error, reason}
+          end
+        after
+          :gen_tcp.close(sock)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp run_stop do
+    case stop_daemon() do
+      {:stopped, pid, :socket} ->
+        IO.puts("hq: stopped daemon (pid #{pid}); socket removed")
+        System.halt(0)
+
+      {:stopped, pid, :socket_unconfirmed} ->
+        IO.puts(
+          "hq: daemon (pid #{pid}) acknowledged the stop request, but its socket is " <>
+            "still present; it may just need another moment to finish shutting down"
+        )
+
+        System.halt(0)
+
+      {:stopped, pid, :signal} ->
+        IO.puts("hq: control socket was not answering; sent a stop signal to pid #{pid}")
+        System.halt(0)
+
+      {:no_daemon, message} ->
+        IO.puts("hq: #{message}")
+        System.halt(0)
+
+      {:refused, message} ->
+        IO.puts(:stderr, "hq: #{message}")
+        System.halt(1)
+    end
+  end
+
+  defp run_restart do
+    case restart_daemon() do
+      {:restarted, old_pid, new_pid} ->
+        IO.puts("hq: restarted (old pid #{old_pid || "none"}, new pid #{new_pid || "unknown"})")
+        System.halt(0)
+
+      {:restart_failed, old_pid, reason} ->
+        IO.puts(
+          :stderr,
+          "hq: stopped old daemon (pid #{old_pid || "none"}) but failed to start a new " <>
+            "one: #{inspect(reason)}"
+        )
+
+        System.halt(1)
+
+      {:refused, message} ->
+        IO.puts(:stderr, "hq: #{message}")
+        System.halt(1)
+    end
+  end
+
   # -- verbs ----------------------------------------------------------------
 
   defp run_daemon do
@@ -492,7 +755,12 @@ defmodule Hq.CLI do
       hq ls                           live sessions, status, mailbox depth, parent
       hq inbox                        what is queued for this pane
       hq release <name>               stop supervising (does not kill the agent)
+      hq stop                         stop the daemon (safe; never pkill/killall)
+      hq restart                      stop the daemon, then start a fresh one
       hq daemon                       run the daemon in the foreground
+
+    After ./install.sh rebuilds hq, a daemon already running keeps serving the
+    OLD build until you `hq restart` -- it does not reload itself.
     """)
 
     System.halt(code)
