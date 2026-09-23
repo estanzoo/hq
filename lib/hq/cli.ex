@@ -270,9 +270,61 @@ defmodule Hq.CLI do
   # -- verbs ----------------------------------------------------------------
 
   defp run_daemon do
-    {:ok, _} = Application.ensure_all_started(:hq)
-    Process.sleep(:infinity)
+    case Application.ensure_all_started(:hq) do
+      {:ok, _} ->
+        Process.sleep(:infinity)
+
+      {:error, reason} ->
+        IO.puts(:stderr, "hq: #{daemon_start_error(reason)}")
+        System.halt(1)
+    end
   end
+
+  # `ensure_daemon/0` already probes the socket before ever spawning `hq
+  # daemon`, so in practice this path is belt-and-braces -- but when
+  # `Hq.Control.init/1` stops with `{:socket_in_use, pid}` (see its
+  # moduledoc), the bare `{:ok, _} = Application.ensure_all_started(:hq)`
+  # this replaced would raise a `MatchError` and dump a raw supervisor crash
+  # report instead of telling the user what actually happened.
+  # `Application.ensure_all_started/1` wraps a failed child's init deep
+  # inside OTP's own supervisor-shutdown shape (roughly `{:hq, {:shutdown,
+  # {:failed_to_start_child, Hq.Control, reason}}}`) -- searching for the
+  # `{:socket_in_use, pid}` tuple rather than pattern-matching that exact
+  # wrapper keeps this working even if a future OTP or supervisor-option
+  # change alters how deep the wrapping goes. Public so a test can assert the
+  # exact wording a user sees by feeding it a synthetic reason, without
+  # calling `Application.ensure_all_started/1` for real -- an application's
+  # start callback runs at most once per node per start, so exercising the
+  # failure twice in one test run (once for `mix test` itself, once for the
+  # test) is not reliably repeatable.
+  @spec daemon_start_error(term()) :: String.t()
+  def daemon_start_error(reason) do
+    case find_socket_in_use(reason) do
+      {:ok, pid} ->
+        "a daemon is already running" <>
+          if(pid, do: " (pid #{pid})", else: "") <>
+          " -- serving #{Hq.Control.socket_path()}"
+
+      :error ->
+        "failed to start: #{inspect(reason)}"
+    end
+  end
+
+  defp find_socket_in_use({:socket_in_use, pid}), do: {:ok, pid}
+
+  defp find_socket_in_use(term) when is_tuple(term),
+    do: term |> Tuple.to_list() |> find_socket_in_use()
+
+  defp find_socket_in_use(term) when is_list(term) do
+    Enum.find_value(term, :error, fn el ->
+      case find_socket_in_use(el) do
+        {:ok, _} = found -> found
+        :error -> nil
+      end
+    end)
+  end
+
+  defp find_socket_in_use(_), do: :error
 
   defp run_verb(argv) do
     case parse(argv) do

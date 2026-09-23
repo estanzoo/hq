@@ -194,6 +194,87 @@ defmodule Hq.ControlTest do
     refute File.exists?(path)
   end
 
+  # This is the whole point of the ownership fix: a stray second daemon
+  # (e.g. a stray `mix run` in this repo, or a plain double-start) must not
+  # be able to steal the socket out from under a live one. The old
+  # `init/1` called `File.rm(path)` unconditionally, so a second
+  # `Hq.Control` here used to win the bind and leave the FIRST one orphaned,
+  # bound to a now-unlinked inode -- reachable to nothing. Asserting the
+  # original still answers a request afterward is what catches that
+  # regression; asserting only that the second start failed would not.
+  test "a second Hq.Control in the same root refuses to start while the first is live" do
+    # `GenServer.start_link` links the caller to the child it spawns. When
+    # `init/1` returns `{:stop, reason}` (reason not `:normal`), that link
+    # delivers an EXIT signal to this test process too -- trap it, or this
+    # process (not being a supervisor) dies from the very signal we're
+    # asserting on instead of getting the `{:error, reason}` return.
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:socket_in_use, _pid}} = GenServer.start_link(Hq.Control, :ok)
+
+    assert %{"ok" => true, "result" => %{"pong" => true}} = request("ping", %{})
+  end
+
+  test "a stale socket file with nothing listening is reclaimed and the daemon starts normally" do
+    # `setup` already bound a real Hq.Control on this root; stop it via
+    # supervised shutdown (see the test above for why that matters) so its
+    # terminate/2 runs and removes both files, then leave a plain file (not
+    # a bound socket) behind at the same path -- nothing can ever answer a
+    # connect to it, which is exactly the "stale" case `init/1` must reclaim
+    # rather than refuse.
+    path = Hq.Control.socket_path()
+    assert :ok = stop_supervised(Hq.Control)
+    refute File.exists?(path)
+
+    File.write!(path, "stale, not a socket")
+    assert File.exists?(path)
+
+    start_supervised!(Hq.Control)
+
+    assert %{"ok" => true, "result" => %{"pong" => true}} = request("ping", %{})
+    assert File.read!(Hq.Control.pid_path()) == System.pid()
+  end
+
+  test "terminate/2 removes the socket and pid file when it owns them" do
+    socket_path = Hq.Control.socket_path()
+    pid_path = Hq.Control.pid_path()
+    assert File.exists?(socket_path)
+    assert File.read!(pid_path) == System.pid()
+
+    pid = Process.whereis(Hq.Control)
+    ref = Process.monitor(pid)
+    assert :ok = stop_supervised(Hq.Control)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+
+    refute File.exists?(socket_path)
+    refute File.exists?(pid_path)
+  end
+
+  # The other half of the ownership fix: once a DIFFERENT daemon's pid is
+  # recorded at this path (because it reclaimed a stale socket after this
+  # one died without ever getting to run terminate/2 -- see the moduledoc
+  # history), this process must recognize it no longer owns the path and
+  # leave both files alone. The old `terminate/2` called `File.rm`
+  # unconditionally and would have deleted the files out from under the new
+  # owner, which is precisely how a third daemon got started in production.
+  test "terminate/2 leaves the socket and pid file alone when the pid file names a different pid" do
+    socket_path = Hq.Control.socket_path()
+    pid_path = Hq.Control.pid_path()
+    assert File.exists?(socket_path)
+
+    # Simulate a second daemon having reclaimed this path after this one
+    # went stale, without ever going through this process's own bind path.
+    File.write!(pid_path, "999999")
+
+    pid = Process.whereis(Hq.Control)
+    ref = Process.monitor(pid)
+    assert :ok = stop_supervised(Hq.Control)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+
+    assert File.exists?(socket_path)
+    assert File.read!(pid_path) == "999999"
+  end
+
   defp eventually(fun, tries \\ 50) do
     Enum.reduce_while(1..tries, false, fn _, _ ->
       if fun.() do

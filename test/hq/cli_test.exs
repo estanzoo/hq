@@ -665,4 +665,34 @@ defmodule Hq.CLITest do
     stat = File.stat!(path, time: :posix)
     File.write_stat!(path, %{stat | mtime: stat.mtime - age_s}, time: :posix)
   end
+
+  # `hq daemon`'s `run_daemon/0` used to do `{:ok, _} =
+  # Application.ensure_all_started(:hq)`, so when `Hq.Control.init/1` stops
+  # with `{:socket_in_use, pid}` (a second daemon started against a root a
+  # live one already owns), the user saw a raw `MatchError` and supervisor
+  # crash dump instead of being told a daemon is already running.
+  # `Application.ensure_all_started/1` buries that reason deep inside OTP's
+  # own supervisor-shutdown wrapper; this feeds `daemon_start_error/1` a
+  # synthetic reason in that authentic shape (confirmed against a real
+  # `Application.ensure_all_started(:hq)` failure while writing this fix)
+  # rather than calling it for real, since an application's start callback
+  # only runs once per node per start -- `mix test` itself already started
+  # `:hq` once, so a second call in-process would just no-op.
+  test "daemon_start_error names a live daemon in plain language, not a crash dump" do
+    reason = {:hq, {:shutdown, {:failed_to_start_child, Hq.Control, {:socket_in_use, "54321"}}}}
+
+    message = Hq.CLI.daemon_start_error(reason)
+
+    assert message =~ "a daemon is already running"
+    assert message =~ "54321"
+  end
+
+  test "daemon_start_error falls back to the raw reason for an unrelated startup failure" do
+    reason = {:hq, {:shutdown, {:failed_to_start_child, Hq.Roster, :boom}}}
+
+    message = Hq.CLI.daemon_start_error(reason)
+
+    refute message =~ "already running"
+    assert message =~ "boom"
+  end
 end
