@@ -4,9 +4,6 @@ A message bus for Claude Code sessions running in [Herdr](https://herdr.dev)
 panes. Sessions address each other by name; messages are queued and typed into
 the target's visible I/O when it next goes idle.
 
-Replaces `bdherd`, whose only handoff was a `RESULT:` line scraped out of a
-pane after an agent had already finished — so agents could never interact.
-
 ## Install
 
 ```bash
