@@ -73,23 +73,39 @@ defmodule Hq.Roster do
 
   @impl true
   def handle_continue(:readopt, state) do
-    live = live_panes()
+    case live_panes() do
+      {:ok, live} ->
+        for entry <- remembered() do
+          cond do
+            Hq.Session.alive?(entry["name"]) ->
+              :ok
 
-    for entry <- remembered() do
-      cond do
-        Hq.Session.alive?(entry["name"]) ->
-          :ok
+            Map.get(live, entry["name"]) == nil ->
+              Logger.info("hq: forgetting #{entry["name"]} — its agent is gone")
+              forget(entry["name"])
 
-        Map.get(live, entry["name"]) == nil ->
-          Logger.info("hq: forgetting #{entry["name"]} — its agent is gone")
-          forget(entry["name"])
+            true ->
+              adopt(entry["name"], Map.fetch!(live, entry["name"]),
+                cwd: entry["cwd"],
+                spawned_by: entry["spawned_by"]
+              )
+          end
+        end
 
-        true ->
-          adopt(entry["name"], Map.fetch!(live, entry["name"]),
-            cwd: entry["cwd"],
-            spawned_by: entry["spawned_by"]
-          )
-      end
+      {:error, reason} ->
+        # A failure here (connection refused, timeout, malformed JSON, ...) is
+        # indistinguishable from "Herdr is fine and just has no agents" unless
+        # we keep the two apart explicitly. Reading it as the latter — as this
+        # used to — takes every remembered session's absence from `live` as
+        # proof its agent is gone and reaps all of them, permanently wiping
+        # sessions.json on nothing more than a single unlucky boot against a
+        # restarting Herdr. Skip the sweep entirely instead: a session that is
+        # genuinely gone is still reaped later by `pane_exited`/`pane_closed`,
+        # or on the next boot once Herdr answers.
+        Logger.warning(
+          "hq: skipping re-adoption sweep — Herdr is unreachable (#{inspect(reason)}); " <>
+            "sessions.json left untouched"
+        )
     end
 
     {:noreply, state}
@@ -121,19 +137,30 @@ defmodule Hq.Roster do
 
   # -- Internals ------------------------------------------------------------
 
-  # %{name => pane_id} for every live NAMED agent. `name` is absent on unnamed
-  # agents, so it must never be assumed present.
+  # {:ok, %{name => pane_id}} for every live NAMED agent, or {:error, reason}
+  # when Herdr could not be reached or answered something unexpected. `name`
+  # is absent on unnamed agents, so it must never be assumed present. The
+  # caller (handle_continue/2) depends on failure and emptiness staying
+  # distinguishable — collapsing both into the same `%{}` is exactly the bug
+  # this shape exists to prevent (see the moduledoc's readopt comment).
+  @spec live_panes() :: {:ok, map()} | {:error, term()}
   defp live_panes do
     case Hq.Herdr.call("agent.list", %{}) do
       {:ok, %{"agents" => agents}} ->
-        for %{"pane_id" => pane_id} = a <- agents,
-            name = Map.get(a, "name"),
-            is_binary(name),
-            into: %{},
-            do: {name, pane_id}
+        map =
+          for %{"pane_id" => pane_id} = a <- agents,
+              name = Map.get(a, "name"),
+              is_binary(name),
+              into: %{},
+              do: {name, pane_id}
 
-      _ ->
-        %{}
+        {:ok, map}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:ok, other} ->
+        {:error, {:unexpected_response, other}}
     end
   end
 

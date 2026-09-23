@@ -54,6 +54,116 @@ defmodule Hq.CLITest do
     assert args["permissive"] == false
   end
 
+  # -- I2: a known verb called with the wrong arity gets a usage-shaped
+  # error naming the verb, not the daemon's opaque `unknown_verb` (which
+  # names the verb too, but gives no hint that arity — not spelling — was
+  # the mistake). Both parse client-side, before request/2 ever opens a
+  # socket, mirroring how require_pane/1 already does this for register/inbox.
+  describe "parse/1: usage-shaped errors for a known verb's wrong arity" do
+    test "send with the body missing (a bare `hq send worker-a`)" do
+      assert {:error, message} = Hq.CLI.parse(["send", "worker-a"])
+      assert message =~ "send:"
+      assert message =~ "hq send <name>"
+    end
+
+    test "send with an unquoted, multi-word message -- the likeliest agent mistake" do
+      assert {:error, message} = Hq.CLI.parse(["send", "worker-a", "schema", "is", "frozen"])
+      assert message =~ "send:"
+    end
+
+    test "register with no name" do
+      assert {:error, message} = Hq.CLI.parse(["register"])
+      assert message =~ "register:"
+    end
+
+    test "release with no name" do
+      assert {:error, message} = Hq.CLI.parse(["release"])
+      assert message =~ "release:"
+    end
+
+    test "a parse error halts with a usage message instead of reaching the daemon" do
+      # run_verb/1 is on the far side of System.halt/1 (untestable directly),
+      # but parse/1 -> the {:error, _} branch it now takes is exercised here.
+      assert {:error, _} = Hq.CLI.parse(["send", "worker-a"])
+    end
+  end
+
+  # -- I3: silent argument loss ------------------------------------------------
+  describe "I3: silent argument loss" do
+    test "parse: `inbox <name>` is a name-scoped request, not silently dropped" do
+      assert {"inbox", %{"name" => "worker-a"}} = Hq.CLI.parse(["inbox", "worker-a"])
+    end
+
+    test "hq inbox <name> end to end reaches THAT session, not the caller's own" do
+      System.put_env("HERDR_PANE_ID", "w2:p1")
+      on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+      {:ok, _} = Hq.Roster.adopt("worker-c", "w2:p1")
+      {:ok, _} = Hq.Roster.adopt("worker-d", "w3:p1")
+      Hq.Session.deliver("worker-d", "worker-a", "for worker-d, not worker-c")
+
+      {verb, args} = Hq.CLI.parse(["inbox", "worker-d"])
+      args = Hq.CLI.decorate(args)
+      assert args["pane_id"] == "w2:p1", "the caller's own pane_id is still attached ambiently"
+
+      assert {:ok, %{"pending" => [%{"body" => "for worker-d, not worker-c"}]}} =
+               Hq.CLI.request(verb, args)
+    end
+
+    test "spawn rejects an unknown flag instead of silently producing a plain pane" do
+      assert {:error, message} = Hq.CLI.parse(["spawn", "worker-a", "--worktre"])
+      assert message =~ "unknown flag"
+      assert message =~ "--worktre"
+    end
+  end
+
+  # I1: none of Hq.Control's listen socket, Hq.CLI's client socket, or
+  # Hq.Herdr's client socket set `buffer:`, so a `packet: :line` frame past
+  # ~9216 bytes truncates (measured: 9044B arrives whole, 12044B does not).
+  # A `send` with a body over that line reached the control socket
+  # truncated, the server's `JSON.decode` failed on the incomplete line, and
+  # the caller saw "hq: unparseable" instead of its message being queued.
+  # This drives the REAL client function (`Hq.CLI.request/2`, what every verb
+  # actually calls) against the REAL daemon (`Hq.Control` + its Handler),
+  # round-tripping the full body back out through the recipient's mailbox —
+  # not just checking that some bytes made it across.
+  test "a send body well over 9 KB round-trips through the control socket without truncating" do
+    {:ok, _} = Hq.Roster.adopt("worker-b", "w6:p1")
+
+    big_body = String.duplicate("The quick brown fox. ", 600)
+    assert byte_size(big_body) > 9_216
+
+    assert {:ok, %{"queued" => true}} =
+             Hq.CLI.request("send", %{
+               "to" => "worker-b",
+               "from" => "worker-a",
+               "body" => big_body
+             })
+
+    assert [%{"body" => body}] = Hq.Session.pending("worker-b")
+    assert body == big_body
+  end
+
+  # The reverse direction: a large RESPONSE (e.g. `hq inbox` holding a big
+  # message) previously truncated on the CLIENT's read, producing
+  # "hq: bad_response" plus mangled JSON on stderr rather than the answer.
+  test "a large inbox response round-trips through the control socket without truncating" do
+    System.put_env("HERDR_PANE_ID", "w2:p1")
+    on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+    {:ok, _} = Hq.Roster.adopt("worker-c", "w2:p1")
+
+    big_body = String.duplicate("held message body. ", 600)
+    assert byte_size(big_body) > 9_216
+    Hq.Session.deliver("worker-c", "worker-a", big_body)
+
+    {verb, args} = Hq.CLI.parse(["inbox"])
+    args = Hq.CLI.decorate(args)
+
+    assert {:ok, %{"pending" => [%{"body" => body}]}} = Hq.CLI.request(verb, args)
+    assert body == big_body
+  end
+
   test "an error response surfaces as {:error, map}" do
     assert {:error, %{"code" => "unknown_target"}} =
              Hq.CLI.request("send", %{"to" => "ghost", "from" => "x", "body" => "y"})
@@ -101,6 +211,90 @@ defmodule Hq.CLITest do
 
     rename = FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == "agent.rename"))
     assert rename["params"] == %{"target" => "w1:p1", "name" => "boss"}
+  end
+
+  # C2: `decorate/1` stamps "from" with the raw pane id ($HERDR_PANE_ID), e.g.
+  # "w1:p1" — every downstream consumer of `spawned_by` (Hq.Spawner,
+  # Hq.Session, Hq.Notify) expects a session NAME instead, so a pane id
+  # reaching them just never matches anything. This drives the REAL pipeline
+  # `parse -> decorate -> request` (not a hand-written "from") through the
+  # real daemon (Hq.Control + Hq.Control.Handler), exactly as `run_verb/1`
+  # does, so a fix that only works when a test hand-writes "from" => "boss"
+  # cannot hide behind it.
+  test "spawned_by reaching a session is a NAME, not the raw pane id decorate/1 attaches", %{
+    fake: fake
+  } do
+    FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
+
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "process_info" => %{
+        "foreground_processes" => [%{"name" => "zsh", "pid" => 999}],
+        "shell_pid" => 999
+      }
+    })
+
+    FakeHerdr.stub(fake, "pane.split", %{
+      "type" => "pane_split",
+      "pane" => %{"pane_id" => "w1:p2"}
+    })
+
+    FakeHerdr.stub(fake, "agent.start", %{
+      "type" => "agent_start",
+      "agent" => %{"name" => "worker-x"}
+    })
+
+    System.put_env("HERDR_PANE_ID", "w1:p1")
+    on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+    # "boss" is the session running in the pane the spawn request comes from
+    # — the daemon must resolve "w1:p1" (what decorate/1 actually attaches)
+    # to "boss" before it ever reaches Hq.Spawner.
+    {:ok, _} = Hq.Roster.adopt("boss", "w1:p1")
+
+    {verb, args} = Hq.CLI.parse(["spawn", "worker-x"])
+    args = Hq.CLI.decorate(args)
+    assert args["from"] == "w1:p1", "decorate/1 must still attach the raw pane id client-side"
+
+    assert :ok = Hq.CLI.require_pane(verb)
+    assert {:ok, %{"name" => "worker-x"}} = Hq.CLI.request(verb, args)
+
+    assert Hq.Session.info("worker-x")["spawned_by"] == "boss"
+    refute Hq.Session.info("worker-x")["spawned_by"] == "w1:p1"
+  end
+
+  # When the calling pane has no supervised session (e.g. the operator's own
+  # pane, never `hq register`ed), the pane id must fall back to "operator"
+  # rather than reach Hq.Spawner as a raw, un-lookupable pane id.
+  test "spawned_by falls back to operator when the calling pane has no supervised session", %{
+    fake: fake
+  } do
+    FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
+
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "process_info" => %{
+        "foreground_processes" => [%{"name" => "zsh", "pid" => 999}],
+        "shell_pid" => 999
+      }
+    })
+
+    FakeHerdr.stub(fake, "pane.split", %{
+      "type" => "pane_split",
+      "pane" => %{"pane_id" => "w1:p2"}
+    })
+
+    FakeHerdr.stub(fake, "agent.start", %{
+      "type" => "agent_start",
+      "agent" => %{"name" => "worker-y"}
+    })
+
+    System.put_env("HERDR_PANE_ID", "w9:p9")
+    on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+    {verb, args} = Hq.CLI.parse(["spawn", "worker-y"])
+    args = Hq.CLI.decorate(args)
+
+    assert {:ok, %{"name" => "worker-y"}} = Hq.CLI.request(verb, args)
+    assert Hq.Session.info("worker-y")["spawned_by"] == "operator"
   end
 
   test "hq inbox resolves the calling pane to its session" do
@@ -240,6 +434,60 @@ defmodule Hq.CLITest do
     # a properly closed one leaves only incidental noise from unrelated
     # concurrency elsewhere in the VM.
     assert length(:erlang.ports()) - base_ports < 8
+  end
+
+  # -- I4: a genuine timeout must report as a timeout, not `no_daemon` --------
+  #
+  # `Hq.Spawner`'s worst-case server-side budget (two 15s `wait_for_shell`
+  # polls plus up to 8 attempts at a 60s `agent.start` each) comfortably
+  # exceeds the old 60s client recv, so a spawn that was simply still
+  # running printed `hq: no_daemon` -- implying the daemon had died -- when
+  # it was healthy and busy. `request_timeout_ms/0` is configurable (mirrors
+  # every other timeout in this codebase, e.g. `settle_ms`) precisely so this
+  # can be proven in well under a second rather than by actually waiting out
+  # the real budget: a fake server here accepts `ensure_daemon/0`'s probe
+  # connection (closing it immediately, exactly like `Hq.Control` answering
+  # `ping`) and then accepts the real request, reads it, and simply never
+  # replies -- forcing `request/2` down its recv-timeout path deterministically.
+  test "a genuine daemon timeout reports `timeout`, not `no_daemon`" do
+    :ok = stop_supervised(Hq.Control)
+    path = Hq.Control.socket_path()
+    File.rm(path)
+
+    {:ok, listen} =
+      :gen_tcp.listen(0, [
+        :binary,
+        {:ifaddr, {:local, path}},
+        active: false,
+        packet: :line,
+        reuseaddr: true
+      ])
+
+    server =
+      spawn(fn ->
+        {:ok, probe} = :gen_tcp.accept(listen, 2_000)
+        :gen_tcp.close(probe)
+
+        case :gen_tcp.accept(listen, 2_000) do
+          {:ok, sock} ->
+            :gen_tcp.recv(sock, 0, 2_000)
+            # Hold well past the client's (shortened) timeout without ever
+            # replying -- the daemon is alive and working, just slow.
+            Process.sleep(300)
+            :gen_tcp.close(sock)
+
+          _ ->
+            :ok
+        end
+      end)
+
+    Application.put_env(:hq, :request_timeout_ms, 50)
+    on_exit(fn -> Application.delete_env(:hq, :request_timeout_ms) end)
+
+    assert {:error, %{"code" => "timeout"}} = Hq.CLI.request("ping", %{})
+
+    Process.exit(server, :kill)
+    :gen_tcp.close(listen)
   end
 
   # -- rendering ---------------------------------------------------------------

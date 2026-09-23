@@ -71,7 +71,13 @@ defmodule FakeHerdr do
         {:ifaddr, {:local, path}},
         active: false,
         packet: :line,
-        reuseaddr: true
+        reuseaddr: true,
+        # Mirrors the real Herdr server (accepts up to 60KB) and the `buffer`
+        # fix on Hq.Herdr's own client socket — without this a large call
+        # here would truncate against the double even after hq's own side is
+        # fixed, since a `packet: :line` frame is capped by whichever end's
+        # buffer is smaller.
+        buffer: 1_000_000
       ])
 
     server = self()

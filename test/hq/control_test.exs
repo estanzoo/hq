@@ -123,6 +123,15 @@ defmodule Hq.ControlTest do
     assert eventually(fn -> not Hq.Session.alive?("worker-a") end)
   end
 
+  # Minor fix: `hq release ghost` used to report success (`:ok = Hq.Roster.forget(name)`
+  # runs unconditionally, and forgetting a name hq never supervised is a
+  # harmless no-op that still returns `:ok`) instead of telling the caller
+  # the target never existed.
+  test "release of a name hq never supervised is an error, not silent success" do
+    assert %{"ok" => false, "error" => %{"code" => "unknown_target"}} =
+             request("release", %{"name" => "ghost"})
+  end
+
   test "register names a pane and supervises it", %{fake: fake} do
     assert %{"ok" => true, "result" => %{"name" => "boss"}} =
              request("register", %{"name" => "boss", "pane_id" => "w1:p1"})

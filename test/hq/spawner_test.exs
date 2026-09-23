@@ -142,6 +142,25 @@ defmodule Hq.SpawnerTest do
     assert text == "#{script} #{expected_worktree_path} >/dev/null 2>&1 || true"
   end
 
+  # Minor fix: Hq.Roster.adopt was passed `cwd: cwd` (the SOURCE checkout)
+  # instead of `cwd: target_dir` (the directory the agent actually runs in) —
+  # identical for a plain pane.split, but wrong for a worktree spawn, where
+  # `hq ls` would show the source checkout instead of the worktree.
+  test "adopts the session with the worktree's own directory, not the source checkout" do
+    assert {:ok, %{"pane_id" => "w7:p1"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => "/tmp/x",
+               "worktree" => true,
+               "base" => "main"
+             })
+
+    expected = Path.join(["/tmp/x", ".worktree", "worker-a"])
+    assert Hq.Session.info("worker-a")["cwd"] == expected
+    refute Hq.Session.info("worker-a")["cwd"] == "/tmp/x"
+  end
+
   test "clears stale credential env BEFORE starting the agent", %{fake: fake} do
     Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 

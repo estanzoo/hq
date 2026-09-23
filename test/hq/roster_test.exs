@@ -84,6 +84,33 @@ defmodule Hq.RosterTest do
     assert eventually(fn -> Hq.Roster.remembered() == [] end)
   end
 
+  # C1: a Herdr outage at boot must never be read as "no live agents". The old
+  # `live_panes/0` collapsed every `Hq.Herdr.call` failure (connection
+  # refused, timeout, malformed JSON) into `%{}`, indistinguishable from
+  # "Herdr answered and has nothing". `handle_continue(:readopt)` then took
+  # `Map.get(live, name) == nil` as proof each remembered agent was gone and
+  # called `forget/1` on all of them, rewriting sessions.json to `[]` — wiping
+  # durable state that no orchestrator running remotely could ever re-adopt.
+  test "surviving Herdr being unreachable at boot: both remembered sessions survive", %{
+    fake: fake
+  } do
+    {:ok, _} = Hq.Roster.adopt("worker-a", "w5:p1")
+    {:ok, _} = Hq.Roster.adopt("worker-b", "w6:p1")
+    :ok = Hq.SessionSup.stop_session("worker-a")
+    :ok = Hq.SessionSup.stop_session("worker-b")
+
+    FakeHerdr.stub_error(fake, "agent.list", %{
+      "code" => "connection_refused",
+      "message" => "herdr is down"
+    })
+
+    start_supervised!(Hq.Roster)
+    Process.sleep(150)
+
+    names = Hq.Roster.remembered() |> Enum.map(& &1["name"]) |> Enum.sort()
+    assert names == ["worker-a", "worker-b"]
+  end
+
   test "forget stops and un-remembers" do
     {:ok, _} = Hq.Roster.adopt("worker-a", "w5:p1")
     :ok = Hq.Roster.forget("worker-a")

@@ -10,6 +10,18 @@ defmodule Hq.CLI do
 
   @lock_stale_ms 30_000
 
+  # I4: `hq spawn`'s single control-socket request is answered only once the
+  # ENTIRE server-side spawn flow finishes (Hq.Spawner runs synchronously
+  # inside Hq.Control.Handler). Its worst-case budget is two
+  # `wait_for_shell` polls (150 attempts * 100ms default = 15s each, so 30s)
+  # plus up to 8 `agent.start` attempts at a 60s Herdr timeout each (480s) —
+  # 510s total. The old 60s recv here was shorter than even ONE of those
+  # `agent.start` attempts, so a spawn that took its time (not a stuck one)
+  # printed `hq: no_daemon` — implying the daemon had died — while it was
+  # simply still working and would likely finish moments later. This must
+  # clear the full 510s budget with room to spare.
+  @request_timeout_ms 600_000
+
   def main(argv) do
     case argv do
       [] -> usage(0)
@@ -22,15 +34,53 @@ defmodule Hq.CLI do
 
   # -- argv -----------------------------------------------------------------
 
-  @spec parse([String.t()]) :: {String.t(), map()}
+  @spec parse([String.t()]) :: {String.t(), map()} | {:error, String.t()}
   def parse(["send", to, body]), do: {"send", %{"to" => to, "body" => body}}
+
+  # I2: a wrong-arity call to a KNOWN verb used to fall straight through to
+  # the catch-all below, which discards every argument and sends the daemon
+  # a bare `{"verb" => "send", "args" => %{}}` — no handler clause matches
+  # that (the real `send` clause requires "to"/"from"/"body"), so it lands on
+  # the generic `unknown_verb` catch-all and prints `hq: send`, naming
+  # neither the real mistake (missing/unquoted args) nor the fix. The
+  # likeliest slip — `hq send worker-a schema is frozen` with the message
+  # left unquoted — parses as 4 extra args, not 2; this catches that shape
+  # too, not just the missing-body case.
+  def parse(["send" | rest]) do
+    {:error,
+     "send: expected `hq send <name> \"<message>\"` (quote a message with spaces); " <>
+       "got #{length(rest)} argument(s)"}
+  end
+
   def parse(["ls"]), do: {"ls", %{}}
   def parse(["inbox"]), do: {"inbox", %{}}
+
+  # I3: `hq inbox worker-a` used to silently return the CALLER's own inbox
+  # instead of erroring or resolving worker-a's — the extra argument was
+  # simply discarded by the `[verb | _]` catch-all before this clause
+  # existed. See the handler-side ordering fix (`Hq.Control.Handler`'s
+  # "name" clause) for why the daemon now honors this rather than letting the
+  # ambient `pane_id` `decorate/1` always attaches win instead.
+  def parse(["inbox", name]), do: {"inbox", %{"name" => name}}
+
+  def parse(["inbox" | rest]) do
+    {:error, "inbox: expected `hq inbox` or `hq inbox <name>`; got #{length(rest)} argument(s)"}
+  end
+
   def parse(["register", name]), do: {"register", %{"name" => name}}
+
+  def parse(["register" | rest]) do
+    {:error, "register: expected `hq register <name>`; got #{length(rest)} argument(s)"}
+  end
+
   def parse(["release", name]), do: {"release", %{"name" => name}}
 
+  def parse(["release" | rest]) do
+    {:error, "release: expected `hq release <name>`; got #{length(rest)} argument(s)"}
+  end
+
   def parse(["spawn", name | rest]) do
-    {flags, _, _} =
+    {flags, _, invalid} =
       OptionParser.parse(rest,
         strict: [
           worktree: :boolean,
@@ -42,21 +92,33 @@ defmodule Hq.CLI do
         ]
       )
 
-    args = %{
-      "name" => name,
-      "worktree" => Keyword.get(flags, :worktree, false),
-      "permissive" => Keyword.get(flags, :permissive, false)
-    }
+    case invalid do
+      [] ->
+        args = %{
+          "name" => name,
+          "worktree" => Keyword.get(flags, :worktree, false),
+          "permissive" => Keyword.get(flags, :permissive, false)
+        }
 
-    args =
-      Enum.reduce([:cwd, :base, :kind, :task], args, fn key, acc ->
-        case Keyword.get(flags, key) do
-          nil -> acc
-          value -> Map.put(acc, to_string(key), value)
-        end
-      end)
+        args =
+          Enum.reduce([:cwd, :base, :kind, :task], args, fn key, acc ->
+            case Keyword.get(flags, key) do
+              nil -> acc
+              value -> Map.put(acc, to_string(key), value)
+            end
+          end)
 
-    {"spawn", args}
+        {"spawn", args}
+
+      [_ | _] ->
+        # I3: `--worktre` (a typo of `--worktree`) used to be silently
+        # dropped -- OptionParser's third return element (the invalid-flag
+        # list) was discarded via `{flags, _, _}` -- so the spawn proceeded
+        # anyway as a plain pane, "succeeding" at the wrong thing instead of
+        # failing loudly on the typo.
+        bad = Enum.map_join(invalid, ", ", fn {flag, _} -> flag end)
+        {:error, "spawn: unknown flag(s): #{bad}"}
+    end
   end
 
   def parse([verb | _]), do: {verb, %{}}
@@ -78,14 +140,31 @@ defmodule Hq.CLI do
       try do
         with :ok <-
                :gen_tcp.send(sock, [JSON.encode!(%{"verb" => verb, "args" => args}), ?\n]),
-             {:ok, line} <- :gen_tcp.recv(sock, 0, 60_000) do
+             {:ok, line} <- :gen_tcp.recv(sock, 0, request_timeout_ms()) do
           case JSON.decode(line) do
             {:ok, %{"ok" => true, "result" => result}} -> {:ok, result}
             {:ok, %{"ok" => false, "error" => error}} -> {:error, error}
             _ -> {:error, %{"code" => "bad_response", "message" => line}}
           end
         else
-          {:error, reason} -> {:error, %{"code" => "no_daemon", "message" => inspect(reason)}}
+          # A `recv` timeout means the connection is (or was, until just now)
+          # alive and the daemon simply hasn't answered yet -- the opposite
+          # situation from every other failure this `with` can hit (a refused
+          # or reset connection, both genuinely "no daemon there"). Reporting
+          # it as `no_daemon` told the caller the daemon had died when it was
+          # actually still working; keep the two apart.
+          {:error, :timeout} ->
+            {:error,
+             %{
+               "code" => "timeout",
+               "message" =>
+                 "the daemon did not respond within #{request_timeout_ms()}ms; a spawn " <>
+                   "can legitimately take several minutes -- check `hq ls` before " <>
+                   "assuming it failed"
+             }}
+
+          {:error, reason} ->
+            {:error, %{"code" => "no_daemon", "message" => inspect(reason)}}
         end
       after
         :gen_tcp.close(sock)
@@ -95,6 +174,8 @@ defmodule Hq.CLI do
       {:error, reason} -> {:error, %{"code" => "no_daemon", "message" => inspect(reason)}}
     end
   end
+
+  defp request_timeout_ms, do: Application.get_env(:hq, :request_timeout_ms, @request_timeout_ms)
 
   @spec ensure_daemon() :: :ok | {:error, term()}
   def ensure_daemon do
@@ -123,7 +204,11 @@ defmodule Hq.CLI do
     :gen_tcp.connect(
       {:local, Hq.Control.socket_path()},
       0,
-      [:binary, active: false, packet: :line],
+      # See Hq.Control's listen socket for why `buffer` is set: without it a
+      # response line past ~9216 bytes (e.g. a large `hq inbox`) truncates
+      # here, `JSON.decode` fails, and the caller sees a confusing
+      # "bad_response" with mangled JSON on stderr instead of its answer.
+      [:binary, active: false, packet: :line, buffer: 1_000_000],
       2_000
     )
   end
@@ -190,23 +275,29 @@ defmodule Hq.CLI do
   end
 
   defp run_verb(argv) do
-    {verb, args} = parse(argv)
-    args = decorate(args)
-
-    with :ok <- require_pane(verb),
-         {:ok, result} <- request(verb, args) do
-      IO.puts(render(verb, result))
-      System.halt(0)
-    else
-      {:error, error} ->
-        IO.puts(:stderr, "hq: #{error["message"] || error["code"]}")
-
-        case error["live"] do
-          [_ | _] = live -> IO.puts(:stderr, "     live: #{Enum.join(live, ", ")}")
-          _ -> :ok
-        end
-
+    case parse(argv) do
+      {:error, message} ->
+        IO.puts(:stderr, "hq: #{message}")
         System.halt(1)
+
+      {verb, args} ->
+        args = decorate(args)
+
+        with :ok <- require_pane(verb),
+             {:ok, result} <- request(verb, args) do
+          IO.puts(render(verb, result))
+          System.halt(0)
+        else
+          {:error, error} ->
+            IO.puts(:stderr, "hq: #{error["message"] || error["code"]}")
+
+            case error["live"] do
+              [_ | _] = live -> IO.puts(:stderr, "     live: #{Enum.join(live, ", ")}")
+              _ -> :ok
+            end
+
+            System.halt(1)
+        end
     end
   end
 

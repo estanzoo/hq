@@ -101,7 +101,7 @@ defmodule Hq.Spawner do
          :ok <- prepare_env(pane_id, cwd, target_dir),
          :ok <- wait_for_shell(pane_id),
          {:ok, _} <- start_agent(name, pane_id, args),
-         {:ok, _pid} <- Hq.Roster.adopt(name, pane_id, cwd: cwd, spawned_by: args["from"]) do
+         {:ok, _pid} <- Hq.Roster.adopt(name, pane_id, cwd: target_dir, spawned_by: args["from"]) do
       first_message(name, args)
       {:ok, %{"name" => name, "pane_id" => pane_id}}
     else
@@ -222,7 +222,8 @@ defmodule Hq.Spawner do
   # separately-checked conditions but one structural match.
   defp pane_shell_ready?(pane_id) do
     match?(
-      {:ok, %{"process_info" => %{"foreground_processes" => [%{"pid" => pid}], "shell_pid" => pid}}},
+      {:ok,
+       %{"process_info" => %{"foreground_processes" => [%{"pid" => pid}], "shell_pid" => pid}}},
       Hq.Herdr.call("pane.process_info", %{"pane_id" => pane_id})
     )
   end

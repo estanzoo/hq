@@ -152,6 +152,47 @@ defmodule Hq.NotifyTest do
     Hq.Session.pending("boss") |> Enum.filter(&(&1["body"] =~ "#{name} is blocked")) |> length()
   end
 
+  # C2 follow-on: once `tell/2` resolves successfully (C2's fix), a
+  # `put_status/2` "blocked" transition calls it SYNCHRONOUSLY from inside a
+  # Session's own `handle_info` — a `GenServer.call` to the parent Session.
+  # If two sessions name each other as parent and both transition to blocked
+  # around the same moment, each is stuck waiting inside its own callback for
+  # the other to answer a call neither can service until its OWN blocking
+  # call returns: a genuine deadlock, resolved only by `@call_timeout` (30s)
+  # crashing both. Delivering from a short-lived Task instead means a
+  # Session's `handle_info` always returns immediately, so its mailbox loop
+  # stays free to answer the other Session's call. Bounding `eventually/2`
+  # well under 30s is what makes this a fast, deterministic proof rather than
+  # a 30s hang: against the unfixed synchronous code this assertion times out
+  # long before either side would even crash.
+  test "two sessions naming each other as parent both survive simultaneous blocked transitions",
+       %{fake: fake} do
+    {:ok, _} = Hq.Roster.adopt("sess-a", "wA:p1", spawned_by: "sess-b")
+    {:ok, _} = Hq.Roster.adopt("sess-b", "wB:p1", spawned_by: "sess-a")
+
+    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+      "pane_id" => "wA:p1",
+      "agent_status" => "blocked"
+    })
+
+    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
+      "pane_id" => "wB:p1",
+      "agent_status" => "blocked"
+    })
+
+    assert eventually(
+             fn ->
+               Hq.Session.pending("sess-b") |> Enum.any?(&(&1["body"] =~ "sess-a is blocked")) and
+                 Hq.Session.pending("sess-a")
+                 |> Enum.any?(&(&1["body"] =~ "sess-b is blocked"))
+             end,
+             100
+           )
+
+    assert Hq.Session.alive?("sess-a")
+    assert Hq.Session.alive?("sess-b")
+  end
+
   test "reaping a session with pending mail tells its parent", %{fake: fake} do
     start_supervised!(Hq.Roster)
     {:ok, _} = Hq.Roster.adopt("boss", "w1:p1")

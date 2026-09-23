@@ -34,7 +34,15 @@ defmodule Hq.Control do
         {:ifaddr, {:local, path}},
         active: false,
         packet: :line,
-        reuseaddr: true
+        reuseaddr: true,
+        # Default driver buffer truncates a `packet: :line` frame past ~9216
+        # bytes — measured against this exact socket: 9044B arrives whole,
+        # 12044B truncates, and the server then can't decode the (now
+        # incomplete) JSON line and answers "unparseable". Agents paste diffs
+        # and logs well past that; the real Herdr server accepts up to 60KB,
+        # so this ceiling was ours alone. Accepted sockets inherit a listen
+        # socket's options, so this one change covers every connection.
+        buffer: 1_000_000
       ])
 
     server = self()

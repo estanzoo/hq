@@ -45,6 +45,26 @@ defmodule Hq.HerdrTest do
     assert length(FakeHerdr.calls(fake)) == 2
   end
 
+  # I1: `Hq.Herdr.connect/1` omitted `buffer:`, so a `packet: :line` frame
+  # past ~9216 bytes truncated — in either direction, since a call both
+  # sends params and reads a result over the same framing. Round-trips a
+  # large value both ways in one call: a >9KB `text` param out, and a >9KB
+  # result field back.
+  test "a body well over 9 KB round-trips through Hq.Herdr.call without truncating", %{
+    fake: fake
+  } do
+    big = String.duplicate("z", 12_000)
+    FakeHerdr.stub(fake, "agent.prompt", %{"type" => "agent_prompt", "echo" => big})
+
+    assert {:ok, %{"echo" => echoed}} =
+             Hq.Herdr.call("agent.prompt", %{"target" => "worker-a", "text" => big})
+
+    assert echoed == big
+
+    [call] = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.prompt"))
+    assert call["params"]["text"] == big
+  end
+
   test "returns an error when the socket does not exist" do
     Application.put_env(
       :hq,

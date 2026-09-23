@@ -37,7 +37,12 @@ defmodule Hq.Herdr do
     :gen_tcp.connect(
       {:local, socket_path()},
       0,
-      [:binary, active: false, packet: :line],
+      # See Hq.Control's listen socket for why `buffer` is set: without it a
+      # `packet: :line` frame past ~9216 bytes truncates, in either
+      # direction — a large `agent.prompt` text out, or a large `agent.list`
+      # result back. The real Herdr server accepts up to 60KB; this ceiling
+      # was ours alone.
+      [:binary, active: false, packet: :line, buffer: 1_000_000],
       timeout
     )
   end
