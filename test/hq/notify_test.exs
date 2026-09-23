@@ -161,36 +161,101 @@ defmodule Hq.NotifyTest do
   # call returns: a genuine deadlock, resolved only by `@call_timeout` (30s)
   # crashing both. Delivering from a short-lived Task instead means a
   # Session's `handle_info` always returns immediately, so its mailbox loop
-  # stays free to answer the other Session's call. Bounding `eventually/2`
-  # well under 30s is what makes this a fast, deterministic proof rather than
-  # a 30s hang: against the unfixed synchronous code this assertion times out
-  # long before either side would even crash.
-  test "two sessions naming each other as parent both survive simultaneous blocked transitions",
-       %{fake: fake} do
+  # stays free to answer the other Session's call.
+  #
+  # An earlier version of this test drove both sides via two
+  # `FakeHerdr.push_event` calls back to back, hoping the two events' async
+  # delivery would race closely enough to collide. It didn't reliably: against
+  # the mutation (reverting `Hq.Notify`'s `Task.start` to a synchronous call)
+  # it only failed about 3 times in 13 runs, because the two sessions' events
+  # did not always land inside each other's `handle_info` at overlapping
+  # moments. Force the collision instead of hoping for it: `:sys.suspend/1`
+  # each Session's own mailbox loop, hand-deliver the `:hq_event` each is
+  # subscribed to directly into its (now-frozen) mailbox, then resume them in
+  # a controlled order with a synchronization point in between. That
+  # guarantees, by construction rather than scheduling luck, that session A
+  # is already blocked waiting on its own outbound call to B before B is ever
+  # allowed to start processing its own blocked transition and call back into
+  # A — the exact reentrant shape the mutation reintroduces.
+  test "two sessions naming each other as parent both survive simultaneous blocked transitions" do
     {:ok, _} = Hq.Roster.adopt("sess-a", "wA:p1", spawned_by: "sess-b")
     {:ok, _} = Hq.Roster.adopt("sess-b", "wB:p1", spawned_by: "sess-a")
 
-    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
-      "pane_id" => "wA:p1",
-      "agent_status" => "blocked"
-    })
+    a = GenServer.whereis(Hq.Session.via("sess-a"))
+    b = GenServer.whereis(Hq.Session.via("sess-b"))
 
-    FakeHerdr.push_event(fake, "pane_agent_status_changed", %{
-      "pane_id" => "wB:p1",
-      "agent_status" => "blocked"
-    })
+    # Drain any startup traffic (handle_continue's :sync, the initial
+    # {:hq_events, :connected}) before we start counting messages, so the
+    # queue-length check below only ever sees the messages this test itself
+    # injects.
+    Hq.Session.info("sess-a")
+    Hq.Session.info("sess-b")
 
+    blocked_event = fn pane_id ->
+      {:hq_event, "pane_agent_status_changed",
+       %{"pane_id" => pane_id, "agent_status" => "blocked"}}
+    end
+
+    :sys.suspend(a)
+    :sys.suspend(b)
+
+    # Both mailboxes are now frozen; queue each session's own blocked
+    # transition directly (bypassing FakeHerdr's async event fan-out, whose
+    # delivery latency is exactly what made the old version racy).
+    send(a, blocked_event.("wA:p1"))
+    send(b, blocked_event.("wB:p1"))
+
+    :sys.resume(a)
+
+    # A now processes its queued blocked event and (under the mutation) makes
+    # a synchronous call into B, which — since B is still suspended — merely
+    # queues behind B's own not-yet-processed blocked event. Wait for that
+    # second message to actually land in B's mailbox: this proves A has
+    # already committed to (and, under the mutation, is now stuck inside) its
+    # call to B before we ever let B run. `Process.info/2` reads the mailbox
+    # directly from the VM, so this never itself risks blocking on either
+    # session.
+    assert eventually(fn -> message_queue_len(b) >= 2 end, 200),
+           "expected session A's notice to reach session B's mailbox before resuming B"
+
+    :sys.resume(b)
+
+    # Under the fix: both notices arrive quickly, since delivery from inside
+    # each Session's own callback backgrounds onto a Task and neither
+    # mailbox loop ever blocks on the other. Under the mutation: B processes
+    # its own blocked event first (FIFO), synchronously calls back into A,
+    # and both are now stuck waiting on each other -- a real deadlock, not a
+    # maybe. `Hq.Session.pending/1` is itself a `GenServer.call` on the same
+    # 30s `@call_timeout`, so calling it directly here would make a genuinely
+    # deadlocked run hang for the full 30s before failing (which is likely
+    # why the old racy version, when it did hit the deadlock, was slow to
+    # report it). Poll through a throwaway `Task` with a short `yield`
+    # instead, so a stuck session reads as "not yet" and this fails fast
+    # rather than tying up the test for 30s.
     assert eventually(
              fn ->
-               Hq.Session.pending("sess-b") |> Enum.any?(&(&1["body"] =~ "sess-a is blocked")) and
-                 Hq.Session.pending("sess-a")
-                 |> Enum.any?(&(&1["body"] =~ "sess-b is blocked"))
+               pending("sess-b") |> Enum.any?(&(&1["body"] =~ "sess-a is blocked")) and
+                 pending("sess-a") |> Enum.any?(&(&1["body"] =~ "sess-b is blocked"))
              end,
              100
            )
 
     assert Hq.Session.alive?("sess-a")
     assert Hq.Session.alive?("sess-b")
+  end
+
+  defp message_queue_len(pid) do
+    {:message_queue_len, n} = Process.info(pid, :message_queue_len)
+    n
+  end
+
+  defp pending(name) do
+    task = Task.async(fn -> Hq.Session.pending(name) end)
+
+    case Task.yield(task, 50) || Task.shutdown(task, :brutal_kill) do
+      {:ok, pending} -> pending
+      _ -> []
+    end
   end
 
   test "reaping a session with pending mail tells its parent", %{fake: fake} do

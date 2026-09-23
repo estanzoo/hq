@@ -15,14 +15,40 @@ defmodule Hq.HerdrTest do
     assert {:ok, %{"agents" => [%{"name" => "a"}]}} = Hq.Herdr.call("agent.list", %{})
   end
 
-  test "sends a STRING id — an integer id is rejected by the real server", %{fake: fake} do
-    FakeHerdr.stub(fake, "ping", %{"type" => "pong"})
-    Hq.Herdr.call("ping", %{})
+  test "sends a STRING id — an integer id is rejected by the real server" do
+    # Assert on the REQUEST framing hq itself writes, not the reply: FakeHerdr
+    # always answers a bad id with `%{"id" => "", ...}` (see
+    # invalid_id_message/1 in test/support/fake_herdr.ex), and "" is itself a
+    # binary, so asserting `is_binary` on the REPLY's id would hold even if
+    # `new_id/0` regressed to an integer. Stand up a raw listener instead of
+    # going through FakeHerdr, so we decode exactly the line the client wrote.
+    path = Path.join(System.tmp_dir!(), "hq-raw-id-#{System.unique_integer([:positive])}.sock")
+    File.rm(path)
 
-    # The double records params; assert framing separately by connecting raw.
-    {:ok, sock} = Hq.Herdr.connect(1_000)
-    :ok = Hq.Herdr.send_request(sock, "ping", %{})
-    {:ok, line} = :gen_tcp.recv(sock, 0, 1_000)
+    {:ok, listen} =
+      :gen_tcp.listen(0, [
+        :binary,
+        {:ifaddr, {:local, path}},
+        active: false,
+        packet: :line,
+        reuseaddr: true
+      ])
+
+    on_exit(fn ->
+      :gen_tcp.close(listen)
+      File.rm(path)
+    end)
+
+    Application.put_env(:hq, :herdr_socket, path)
+
+    {:ok, client} = Hq.Herdr.connect(1_000)
+    :ok = Hq.Herdr.send_request(client, "ping", %{})
+
+    {:ok, server} = :gen_tcp.accept(listen, 1_000)
+    {:ok, line} = :gen_tcp.recv(server, 0, 1_000)
+    :gen_tcp.close(client)
+    :gen_tcp.close(server)
+
     assert %{"id" => id} = JSON.decode!(line)
     assert is_binary(id)
   end

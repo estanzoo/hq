@@ -311,8 +311,26 @@ defmodule Hq.SpawnerTest do
 
     assert Hq.Session.alive?("worker-a")
 
-    checks = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "pane.process_info"))
-    assert length(checks) >= 2
+    # A raw call-count assertion here (`>= 2`) does not kill a mutated
+    # `wait_for_shell/2` that checks once and proceeds regardless: `do_spawn`
+    # calls `wait_for_shell` at TWO call sites (before prepare_env and again
+    # before start_agent), so two `pane.process_info` calls happen even with
+    # zero retries. State the actual property instead: the pane must be
+    # confirmed READY -- not merely checked once -- before anything is typed
+    # into it. The stub above answers busy, then ready, so a genuine retry
+    # means the check immediately preceding the first `pane.send_input` is
+    # NOT the lone busy reply; with zero retries, prepare_env's send_input
+    # follows directly on the heels of that single busy check.
+    calls = FakeHerdr.calls(fake)
+    send_input_index = Enum.find_index(calls, &(&1["method"] == "pane.send_input"))
+    assert send_input_index, "expected at least one pane.send_input call"
+
+    checks_before_write =
+      calls |> Enum.take(send_input_index) |> Enum.count(&(&1["method"] == "pane.process_info"))
+
+    assert checks_before_write >= 2,
+           "expected the busy reply to be retried (>=2 process_info checks) before the first " <>
+             "send_input, got #{checks_before_write}"
 
     starts = FakeHerdr.calls(fake) |> Enum.filter(&(&1["method"] == "agent.start"))
     assert length(starts) == 1

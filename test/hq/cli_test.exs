@@ -169,16 +169,15 @@ defmodule Hq.CLITest do
              Hq.CLI.request("send", %{"to" => "ghost", "from" => "x", "body" => "y"})
   end
 
-  test "concurrent ensure_daemon calls start exactly one daemon" do
-    # The control socket is already up, so ensure_daemon must be a no-op for
-    # every caller rather than racing to start a second one.
-    results =
-      1..10
-      |> Task.async_stream(fn _ -> Hq.CLI.ensure_daemon() end, max_concurrency: 10)
-      |> Enum.map(fn {:ok, r} -> r end)
-
-    assert Enum.all?(results, &(&1 == :ok))
-  end
+  # A "concurrent ensure_daemon calls start exactly one daemon" test used to
+  # live here. Deleted: `setup` already brings `Hq.Control` up, so every
+  # caller's first `connect()` inside `ensure_daemon/0` succeeds immediately
+  # and `with_lock/1` -- including the O_EXCL open this test was meant to
+  # guard -- is never reached. Reverting `with_lock/1` to no locking at all
+  # still passed it. The real lock path is driven, and killed, by "a burst of
+  # concurrent ensure_daemon calls starts exactly one daemon (O_EXCL lock)"
+  # below, which stops Hq.Control first so every caller is forced through
+  # with_lock/1.
 
   # -- register: the entry point to the whole system -------------------------
   #
@@ -540,17 +539,17 @@ defmodule Hq.CLITest do
 
   # -- daemon autostart: O_EXCL lock ------------------------------------------
   #
-  # The test above ("concurrent ensure_daemon calls start exactly one
-  # daemon") starts Hq.Control in `setup` before it ever runs, so every
-  # caller's very first `connect()` inside `ensure_daemon/0` already succeeds
-  # -- the whole `with_lock/1` branch, including the O_EXCL open, is never
-  # reached. That makes it a test that would pass identically against a
-  # version of `with_lock/1` with no locking at all (verified below and in
-  # the task report). These two tests stop Hq.Control first, so every caller
-  # is forced through `with_lock/1`, and replace the real `hq` binary on
-  # `$PATH` with a stub that only records that it ran -- proving the lock's
-  # mutual-exclusion property against the real code, not a re-implementation
-  # of it, without needing a real daemon to come up.
+  # `setup` above brings `Hq.Control` up before any test runs, so a naive
+  # "concurrent ensure_daemon calls" test would have every caller's very
+  # first `connect()` inside `ensure_daemon/0` already succeed -- the whole
+  # `with_lock/1` branch, including the O_EXCL open, would never be reached.
+  # That made such a test pass identically against a version of
+  # `with_lock/1` with no locking at all (verified in the task report), so it
+  # was deleted rather than kept alongside these two, which stop Hq.Control
+  # first so every caller is forced through `with_lock/1`, and replace the
+  # real `hq` binary on `$PATH` with a stub that only records that it ran --
+  # proving the lock's mutual-exclusion property against the real code, not
+  # a re-implementation of it, without needing a real daemon to come up.
   test "a burst of concurrent ensure_daemon calls starts exactly one daemon (O_EXCL lock)", %{
     root: root
   } do

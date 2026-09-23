@@ -50,16 +50,14 @@ defmodule Hq.Herdr.EventsTest do
                    1_000
   end
 
-  test "leaves an already-snake_case pushed kind unchanged", %{fake: fake} do
-    subs = [%{"type" => "pane.closed"}]
-    {:ok, _pid} = Hq.Herdr.Events.start_link(owner: self(), subscriptions: subs)
-
-    assert_receive {:hq_events, :connected}, 1_000
-
-    FakeHerdr.push_event(fake, "pane_closed", %{"pane_id" => "w5:p1"})
-
-    assert_receive {:hq_event, "pane_closed", %{"pane_id" => "w5:p1"}}, 1_000
-  end
+  # A standalone "already-snake_case kind unchanged" test used to live here.
+  # Deleted: `normalize_kind(kind), do: kind` alone still passed it (pushing
+  # `pane_closed` makes normalization a no-op either way), and the inverse
+  # mutation that did kill it (`String.replace(kind, "_", ".")`) also killed
+  # three other tests, so it caught nothing uniquely. The dotted test above
+  # and Hq.SessionTest's normalize_kind coverage already prove
+  # `normalize_kind/1` is necessary; a test that cannot fail alone is worse
+  # than no test.
 
   test "sends the subscriptions verbatim", %{fake: fake} do
     subs = [%{"type" => "pane.agent_status_changed", "pane_id" => "w5:p1"}]
@@ -103,17 +101,28 @@ defmodule Hq.Herdr.EventsTest do
 
     before = length(Port.list())
 
-    for _ <- 1..50 do
+    # 300 iterations, not 50: at 50 iterations a reintroduced leak (dropping
+    # the `:gen_tcp.close(sock)` below) measured growth of exactly 50 against
+    # a `< 50` bound -- a margin of exactly one port, so any single incidental
+    # port closing elsewhere in the VM would let a real leak through. Measured
+    # directly at 300 iterations: growth is 0 with the fix in place, and 300
+    # (one leaked port per call) with the leak reintroduced -- so the bound
+    # below has a wide margin instead of being one port from either outcome.
+    iterations = 300
+
+    for _ <- 1..iterations do
       assert {:error, _} = Hq.Herdr.Events.subscribe([%{"type" => "pane.created"}])
     end
 
     after_count = length(Port.list())
     growth = after_count - before
 
-    # Without the fix: growth includes 50 leaked client sockets on top of the
-    # server-side accepts. With the fix: only the (already-closed) accepts
-    # contribute, so growth stays well under 50.
-    assert growth < 50,
+    # Without the fix: growth tracks the iteration count 1:1 (one leaked
+    # client socket per call, on top of the server-side accepts). With the
+    # fix: only the (already-closed) accepts contribute, so growth stays flat
+    # regardless of iteration count. A leak of even one port per ten calls
+    # would still clear this bound by a wide margin.
+    assert growth < div(iterations, 10),
            "Port growth: #{growth} (before: #{before}, after: #{after_count}) - possible socket leak"
   end
 
