@@ -85,6 +85,178 @@ defmodule Hq.SpawnerTest do
     assert Hq.Session.alive?("worker-a")
   end
 
+  # -- --cwd pointed at an existing worktree (no --worktree) -----------------
+  #
+  # skills/hq/SKILL.md's "Ordered tasks sharing a branch" workflow spawns the
+  # first task with --worktree (its own new workspace) and later tasks with
+  # --cwd <that worktree path> (no --worktree). Those later spawns used to
+  # always pane.split in the CALLER's workspace; they must now land in the
+  # worktree's own workspace instead, matching the first task.
+
+  defp worktree_list_stub(fake, worktrees) do
+    FakeHerdr.stub(fake, "worktree.list", %{
+      "type" => "worktree_list",
+      "source" => %{
+        "repo_key" => "/tmp/repo/.git",
+        "repo_name" => "repo",
+        "repo_root" => "/tmp/repo",
+        "source_checkout_path" => "/tmp/repo"
+      },
+      "worktrees" => worktrees
+    })
+  end
+
+  defp worktree_entry(path, opts \\ []) do
+    %{
+      "path" => path,
+      "is_bare" => false,
+      "is_detached" => false,
+      "is_prunable" => false,
+      "is_linked_worktree" => Keyword.get(opts, :linked, true),
+      "label" => "repo"
+    }
+    |> then(fn entry ->
+      case Keyword.get(opts, :open_workspace_id) do
+        nil -> entry
+        id -> Map.put(entry, "open_workspace_id", id)
+      end
+    end)
+  end
+
+  defp unique_worktree_path do
+    Path.join(System.tmp_dir!(), "hq-worktree-#{System.unique_integer([:positive])}")
+  end
+
+  test "an OPEN worktree workspace: splits with that workspace's workspace_id", %{fake: fake} do
+    worktree_path = unique_worktree_path()
+
+    worktree_list_stub(fake, [
+      worktree_entry("/tmp/repo", linked: false, open_workspace_id: "w-primary"),
+      worktree_entry(worktree_path, open_workspace_id: "w-linked")
+    ])
+
+    assert {:ok, %{"pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => worktree_path
+             })
+
+    assert call(fake, "pane.split")["params"]["workspace_id"] == "w-linked"
+    refute "worktree.open" in methods(fake)
+    assert Hq.Session.alive?("worker-a")
+  end
+
+  test "a CLOSED worktree workspace: opens it and lands the agent in its root pane",
+       %{fake: fake} do
+    worktree_path = unique_worktree_path()
+
+    worktree_list_stub(fake, [worktree_entry(worktree_path)])
+
+    FakeHerdr.stub(fake, "worktree.open", %{
+      "type" => "worktree_opened",
+      "already_open" => false,
+      "workspace" => %{
+        "workspace_id" => "w-opened",
+        "number" => 3,
+        "label" => "repo",
+        "focused" => false,
+        "pane_count" => 1,
+        "tab_count" => 1,
+        "active_tab_id" => "t1",
+        "agent_status" => "idle"
+      },
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{
+        "pane_id" => "w-opened:p1",
+        "terminal_id" => "term1",
+        "workspace_id" => "w-opened",
+        "tab_id" => "t1",
+        "focused" => true,
+        "agent_status" => "idle",
+        "revision" => 1
+      },
+      "worktree" => worktree_entry(worktree_path, open_workspace_id: "w-opened")
+    })
+
+    assert {:ok, %{"pane_id" => "w-opened:p1"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => worktree_path
+             })
+
+    assert call(fake, "worktree.open")["params"]["path"] == worktree_path
+    refute "pane.split" in methods(fake)
+    assert Hq.Session.alive?("worker-a")
+  end
+
+  test "a --cwd that is not a worktree behaves exactly as before", %{fake: fake} do
+    worktree_list_stub(fake, [worktree_entry("/tmp/repo", linked: false)])
+
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert "worktree.list" in methods(fake)
+    refute "worktree.open" in methods(fake)
+    refute call(fake, "pane.split")["params"]["workspace_id"]
+  end
+
+  test "does not route through the primary checkout's own workspace_id", %{fake: fake} do
+    worktree_list_stub(fake, [
+      worktree_entry("/tmp/x", linked: false, open_workspace_id: "w-primary")
+    ])
+
+    assert {:ok, %{"pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    refute call(fake, "pane.split")["params"]["workspace_id"]
+  end
+
+  test "a failing worktree.list falls back to a plain split and the spawn still succeeds",
+       %{fake: fake} do
+    FakeHerdr.stub_error(fake, "worktree.list", %{"code" => "internal_error", "message" => "boom"})
+
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    assert Hq.Session.alive?("worker-a")
+    refute call(fake, "pane.split")["params"]["workspace_id"]
+  end
+
+  test "a failing worktree.open falls back to a plain split and the spawn still succeeds",
+       %{fake: fake} do
+    worktree_path = unique_worktree_path()
+
+    worktree_list_stub(fake, [worktree_entry(worktree_path)])
+    FakeHerdr.stub_error(fake, "worktree.open", %{"code" => "worktree_busy", "message" => "boom"})
+
+    assert {:ok, %{"pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => worktree_path
+             })
+
+    assert call(fake, "pane.split")["params"]["cwd"] == worktree_path
+    refute call(fake, "pane.split")["params"]["workspace_id"]
+  end
+
+  test "matches a worktree path even when cwd carries a cosmetic difference", %{fake: fake} do
+    worktree_path = unique_worktree_path()
+
+    worktree_list_stub(fake, [worktree_entry(worktree_path, open_workspace_id: "w-linked")])
+
+    assert {:ok, %{"pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => worktree_path <> "/"
+             })
+
+    assert call(fake, "pane.split")["params"]["workspace_id"] == "w-linked"
+  end
+
   test "creates a worktree when asked", %{fake: fake} do
     assert {:ok, %{"pane_id" => "w7:p1"}} =
              Hq.Spawner.spawn_agent(%{

@@ -172,8 +172,102 @@ defmodule Hq.Spawner do
     end
   end
 
+  # A bare `--cwd` (no `--worktree`) used to always `pane.split` in whatever
+  # workspace the CALLER happens to be in. That is right for an ordinary
+  # directory, but wrong for the documented "ordered tasks sharing a branch"
+  # workflow (skills/hq/SKILL.md): later tasks are spawned with `--cwd
+  # <path>` pointing at a worktree the FIRST task already created with
+  # `--worktree`. Splitting in the caller's workspace strands those agents
+  # visually in the orchestrator's workspace instead of the worktree's own —
+  # confusing, and broken once the first worker's workspace is closed.
+  #
+  # So: look up whether `cwd` names a linked worktree Herdr already knows
+  # about, and if so place the pane in ITS workspace (opening it first if
+  # it's not currently open) instead of the caller's. This is a placement
+  # nicety layered on top of the existing split, not a replacement for it —
+  # any failure of the lookup or the open falls back to exactly the old
+  # behaviour (split_pane/1) rather than failing the spawn.
   defp make_pane(_name, _args, cwd) do
-    params = %{"direction" => "right", "focus" => false} |> maybe_put("cwd", cwd)
+    case cwd && linked_worktree(cwd) do
+      %{"open_workspace_id" => workspace_id} when is_binary(workspace_id) ->
+        split_pane(cwd, workspace_id)
+
+      %{"path" => path} ->
+        case open_worktree_pane(cwd, path) do
+          {:ok, _pane_id, _target_dir} = ok ->
+            ok
+
+          {:error, reason} ->
+            Logger.debug(
+              "hq: worktree.open failed for #{path}, falling back to a plain split: " <>
+                inspect(reason)
+            )
+
+            split_pane(cwd)
+        end
+
+      _ ->
+        split_pane(cwd)
+    end
+  end
+
+  # Finds the entry in `worktree.list` whose path matches `cwd`, but only
+  # among LINKED worktrees: the primary checkout appears in this same list
+  # (`is_linked_worktree: false`) and must keep splitting in the caller's
+  # workspace exactly as before — it is not the "nested under the primary
+  # repo" case this feature exists for.
+  #
+  # `cwd` can arrive with a symlinked or non-canonical prefix (macOS
+  # `/var` vs `/private/var`, a trailing slash, ...), so both sides are run
+  # through `Path.expand/1` before comparing. Any failure here — the call
+  # errors, or the response is not shaped as expected — is logged and
+  # treated as "no match", which routes the caller straight to the old
+  # split behaviour; this lookup must never be the reason a spawn fails.
+  defp linked_worktree(cwd) do
+    case Hq.Herdr.call("worktree.list", %{"cwd" => cwd}) do
+      {:ok, %{"worktrees" => worktrees}} when is_list(worktrees) ->
+        target = Path.expand(cwd)
+
+        Enum.find(worktrees, fn entry ->
+          Map.get(entry, "is_linked_worktree") == true and
+            match?(%{"path" => path} when is_binary(path), entry) and
+            Path.expand(entry["path"]) == target
+        end)
+
+      {:ok, other} ->
+        Logger.debug("hq: worktree.list returned an unexpected shape: #{inspect(other)}")
+        nil
+
+      {:error, reason} ->
+        Logger.debug(
+          "hq: worktree.list failed, falling back to a plain split: " <> inspect(reason)
+        )
+
+        nil
+    end
+  end
+
+  # `worktree.open`'s response carries a `root_pane` (required per the API
+  # schema) for the workspace it opened or focused — prefer that directly
+  # over an extra `pane.split` call rather than opening the workspace and
+  # then splitting a second pane inside it.
+  defp open_worktree_pane(cwd, path) do
+    case Hq.Herdr.call("worktree.open", %{"path" => path, "focus" => false}) do
+      {:ok, %{"root_pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
+      {:ok, other} -> {:error, {:no_pane_in_response, other}}
+      error -> error
+    end
+  end
+
+  # The plain `pane.split` this branch always did. `workspace_id`, when
+  # given, scopes the split to an already-open worktree workspace found by
+  # `linked_worktree/1`; omitted, Herdr splits in the caller's own
+  # workspace — today's behaviour, unchanged.
+  defp split_pane(cwd, workspace_id \\ nil) do
+    params =
+      %{"direction" => "right", "focus" => false}
+      |> maybe_put("cwd", cwd)
+      |> maybe_put("workspace_id", workspace_id)
 
     case Hq.Herdr.call("pane.split", params) do
       {:ok, %{"pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
