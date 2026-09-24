@@ -71,77 +71,123 @@ names what currently holds it — shorten differently and register again.
 
 ## Running an epic
 
-You own all the policy. `hq` only moves messages and starts agents.
+You own all the policy. `hq` only moves messages and starts agents — it never
+merges branches. Merging, when a task needs it, is your job.
 
-1. Read the epic yourself:
+### 1. Read the epic and its dependency graph
 
-   ```bash
-   br --db ~/beads-planning/.beads/beads.db ready --json
-   ```
+```bash
+BR="br --db $HOME/beads-planning/.beads/beads.db"
+$BR show <epic>            # what the epic is
+$BR dep tree <epic>        # the whole graph: which task waits on which
+$BR dep list <task>        # what one task waits on (its dependencies)
+```
 
-2. Sort the tasks into three groups. There is no branch merging, so what
-   matters is which tasks would collide on the same files:
+The dependency graph decides everything below. Read it before spawning anyone.
 
-   - **Independent** — touch different files. Run them in parallel, each in
-     its own worktree.
-   - **Ordered, same branch** — touch the same files, or must land in a set
-     order. Run them one at a time in ONE worktree, a fresh agent per task.
-     This is the common case for an epic's numbered children, and it needs
-     no merging at all.
-   - **Genuinely inseparable** — one change that cannot be committed in
-     pieces. Only these go to a single agent as a batch.
+### 2. One rule: every task gets its own worktree, based on its dependencies
 
-3. **Spawn one agent per task. One task per agent is the default; batching
-   several tasks into one agent is the exception you opt into deliberately.**
+**Each task runs in its own worktree, on its own branch, based on the merge of
+the branches of the tasks it depends on.** One task per agent, always.
+Batching several tasks into one agent carries each task's context into the
+next and turns a single wedge into the loss of the whole chain; do it only for
+a change that genuinely cannot be committed in pieces.
 
-   A batched agent carries every earlier task's context into the later ones,
-   and if it wedges partway you lose the whole chain rather than one task.
+That one rule covers every shape of epic:
 
-   Independent tasks, in parallel:
+| a task's dependencies | its base |
+|---|---|
+| none | `main` |
+| exactly one | that task's branch |
+| several | the merge of their branches — which you build first (step 4) |
 
-   ```bash
-   hq spawn ca-ingress-1 --worktree --base main --cwd "$PWD" \
-     --task "Implement <bead>. Commit to your branch. Do not push."
-   ```
+Because every task has its own worktree, each worker gets its own entry in the
+Herdr sidebar, nested under the repo, and stays there after it finishes so the
+user can review it.
 
-   Ordered tasks sharing a branch — spawn them **sequentially into the same
-   worktree**, waiting for each to finish. The first call creates the
-   worktree; read its path out of `hq ls` (the `cwd` column) and pass it to
-   the rest with `--cwd` and no `--worktree`, so they land in that same
-   checkout:
+A task can only start once **all** of its dependencies have finished and
+committed. Tasks with no unfinished dependencies can run at the same time.
 
-   ```bash
-   # first task creates the worktree and the branch
-   hq spawn ca-ingress-1 --worktree --base main --cwd "$PWD" \
-     --task "Implement <bead .1> ONLY. Commit to this branch. Do not push."
+### 3. Spawning
 
-   # ... wait for ca-ingress-1 to report, then:
-   hq release ca-ingress-1
-   hq spawn ca-ingress-3 --cwd "<that worktree path>" \
-     --task "Implement <bead .3> ONLY. Commit to this branch. Do not push."
-   ```
+Find a finished dependency's branch from its worktree — the worker may have
+renamed it, so read it rather than assuming `agent/<name>`:
 
-   Each task starts with clean context, the order is preserved, and every
-   commit lands on one branch — so nothing has to be merged afterwards.
+```bash
+git worktree list          # every worktree, with the branch checked out in it
+```
 
-   Add `--kind <kind>` to pick a non-default agent kind, or `--permissive` to
-   skip that worker's permission prompts entirely — only when the user has
-   asked for an unattended run.
+**No dependencies** — branch from `main`:
 
-4. Watch them:
+```bash
+hq spawn ev-limit-1 --worktree --base main --cwd "$PWD" \
+  --task "Implement <bead .1>. Commit to your branch. Do not push."
+```
 
-   ```bash
-   hq ls
-   ```
+**One dependency** — branch from it, so the new task builds on its commits:
 
-5. Workers message you and each other as they go. Their mail is typed into
-   your session prefixed `[hq]`, which wakes you.
+```bash
+hq spawn ev-limit-2 --worktree --base <ev-limit-1's branch> --cwd "$PWD" \
+  --task "Implement <bead .2>. Commit to your branch. Do not push."
+```
 
-   Each worker is told its parent by the spawn preamble itself (`hq send
-   <name-you-registered> "<message>"`) — you don't need to spell out "report
-   to `<your-name>`" in `--task`. Don't tell a worker to message "orchestrator"
-   by that literal name; it should address whatever name you actually
-   registered, which the preamble already gave it.
+Add `--kind <kind>` to pick a non-default agent kind, or `--permissive` to
+skip that worker's permission prompts entirely — only when the user has asked
+for an unattended run.
+
+### 4. Several dependencies: merge them first, then spawn into the result
+
+When a task depends on several others — say `.4` needs `.1`, `.2` and `.3` —
+build its worktree yourself by merging their branches, and only then spawn the
+agent into it. Do this from the repository root, never inside the primary
+checkout's working tree:
+
+```bash
+# a new worktree + branch for .4, starting from the first dependency
+git worktree add -b feat/ev-limit-4 .worktree/ev-limit-4 <branch of .1>
+
+# merge the remaining dependencies into it
+git -C .worktree/ev-limit-4 merge --no-edit <branch of .2> <branch of .3>
+```
+
+**If the merge conflicts, stop.** Run `git -C .worktree/ev-limit-4 merge
+--abort` and do not spawn onto a conflicted tree. A conflict means those tasks
+were not independent after all. Either resolve it yourself, or spawn a worker
+whose only task is resolving it, or ask the user — but decide deliberately.
+
+When the merge is clean, spawn the task into that worktree with `--cwd` and no
+`--worktree`. hq opens it as its own workspace, so it still gets its own
+sidebar entry:
+
+```bash
+hq spawn ev-limit-4 --cwd "$PWD/.worktree/ev-limit-4" \
+  --task "Implement <bead .4>. Commit to this branch. Do not push."
+```
+
+Always give `--cwd` an **absolute** path, as above. hq hands it to its daemon,
+which does not share your working directory — a relative path is resolved
+against wherever the daemon happened to start, not where you are.
+
+### 5. Watch, and let workers report
+
+```bash
+hq ls
+```
+
+Workers message you and each other as they go. Their mail is typed into your
+session prefixed `[hq]`, which wakes you. Each worker is told its parent by the
+spawn preamble, so you don't need to say "report to `<your-name>`" in `--task`,
+and never tell a worker to message "orchestrator" by that literal name.
+
+Leave finished workers open — they are the record the user reviews, and each
+has its own sidebar entry. The user closes them when done.
+
+### 6. When the epic is done
+
+The task that depends on everything else — directly or through the chain —
+has a branch containing all of the epic's work. **Report which branch that is**
+in your summary to the user. Do not push, open a PR, or move a shared branch
+such as the feature branch; the user decides how it lands.
 
 ## Messaging
 
@@ -166,8 +212,8 @@ it goes idle. Tell peers what you have decided rather than waiting to be asked.
 - `hq stop` / `hq restart` stop or restart the daemon itself -- never `pkill`
   or `killall` it. After `./install.sh`, `hq restart` is required for an
   already-running daemon to pick up the new build.
-- One task per agent by default. Batching tasks into one agent accumulates
-  context across them and makes a single wedge lose the whole chain.
-- There is no branch merging. For work that shares files, prefer sequential
-  agents in one worktree (above) over either batching them into one agent or
-  merging branches yourself afterwards.
+- One task per agent, each in its own worktree, based on the merge of its
+  dependencies' branches.
+- hq never merges. When a task has several dependencies you merge their
+  branches into its worktree yourself, before spawning — and stop on a
+  conflict rather than spawning onto it.
