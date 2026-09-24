@@ -186,11 +186,27 @@ defmodule Hq.Spawner do
   # it's not currently open) instead of the caller's. This is a placement
   # nicety layered on top of the existing split, not a replacement for it —
   # any failure of the lookup or the open falls back to exactly the old
-  # behaviour (split_pane/1) rather than failing the spawn.
-  defp make_pane(_name, _args, cwd) do
+  # behaviour (split_pane/2) rather than failing the spawn.
+  #
+  # `caller_pane_id` is `args["pane_id"]` -- the caller's own pane, stamped
+  # by `Hq.CLI.decorate/1` and carried through untouched by
+  # `Hq.Control.Handler.resolve_from/1` (which only rewrites "from"). Herdr's
+  # own docs (`herdr --skill`) say an omitted `pane.split` target "uses the
+  # calling pane when HERDR_PANE_ID is available, otherwise the focused
+  # pane" -- but hq talks to Herdr over the raw socket with no pane context
+  # of its own, so every untargeted split used to land beside whatever pane
+  # the USER happened to have focused at that instant, scattering workers
+  # across whichever run the user was last looking at. Passing the caller's
+  # own pane as `target_pane_id` on the fallback split fixes that. It is
+  # deliberately NOT passed alongside `workspace_id` (see split_pane/2):
+  # targeting the orchestrator's pane there would drag the worker back into
+  # the orchestrator's workspace, undoing the workspace_id placement above.
+  defp make_pane(_name, args, cwd) do
+    caller_pane_id = Map.get(args, "pane_id")
+
     case cwd && linked_worktree(cwd) do
       %{"open_workspace_id" => workspace_id} when is_binary(workspace_id) ->
-        split_pane(cwd, workspace_id)
+        split_pane(cwd, workspace_id: workspace_id)
 
       %{"path" => path} ->
         case open_worktree_pane(cwd, path) do
@@ -203,11 +219,11 @@ defmodule Hq.Spawner do
                 inspect(reason)
             )
 
-            split_pane(cwd)
+            split_pane(cwd, target_pane_id: caller_pane_id)
         end
 
       _ ->
-        split_pane(cwd)
+        split_pane(cwd, target_pane_id: caller_pane_id)
     end
   end
 
@@ -259,15 +275,29 @@ defmodule Hq.Spawner do
     end
   end
 
-  # The plain `pane.split` this branch always did. `workspace_id`, when
+  # The plain `pane.split` this branch always did. `:workspace_id`, when
   # given, scopes the split to an already-open worktree workspace found by
-  # `linked_worktree/1`; omitted, Herdr splits in the caller's own
-  # workspace — today's behaviour, unchanged.
-  defp split_pane(cwd, workspace_id \\ nil) do
+  # `linked_worktree/1`. `:target_pane_id`, when given, is the CALLER's own
+  # pane (see the comment on `make_pane/3` above) and makes the split land
+  # beside whoever asked for the spawn instead of an untargeted split
+  # drifting to whatever pane the user happens to have focused.
+  #
+  # The two are mutually exclusive by construction, not by caller
+  # discipline: `workspace_id` already places the split inside the
+  # worktree's own workspace, so a `target_pane_id` pointing at the
+  # orchestrator's pane (which lives in a DIFFERENT workspace) would drag the
+  # worker back out of it. Enforcing that here, in the one function that
+  # builds `pane.split`'s params, means no call site has to remember the
+  # precedence itself.
+  defp split_pane(cwd, opts) do
+    workspace_id = Keyword.get(opts, :workspace_id)
+    target_pane_id = if workspace_id, do: nil, else: Keyword.get(opts, :target_pane_id)
+
     params =
       %{"direction" => "right", "focus" => false}
       |> maybe_put("cwd", cwd)
       |> maybe_put("workspace_id", workspace_id)
+      |> maybe_put("target_pane_id", target_pane_id)
 
     case Hq.Herdr.call("pane.split", params) do
       {:ok, %{"pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}

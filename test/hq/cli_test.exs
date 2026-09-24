@@ -261,6 +261,56 @@ defmodule Hq.CLITest do
     refute Hq.Session.info("worker-x")["spawned_by"] == "w1:p1"
   end
 
+  # The bug this test guards: Hq.Spawner's fallback `pane.split` (no worktree
+  # workspace to target) omitted a split target entirely, so Herdr's own
+  # documented fallback ("uses the calling pane when HERDR_PANE_ID is
+  # available, otherwise the focused pane") took over -- except hq talks to
+  # Herdr over the raw socket with no pane context of its own, so the split
+  # actually landed beside whatever pane the USER happened to have focused at
+  # that instant. `decorate/1` already stamps every request's args with
+  # `"pane_id"` (the caller's own pane, see the comment on
+  # `Hq.Control.Handler.handle/1`); this drives that value through the REAL
+  # pipeline -- parse -> decorate -> request -> Hq.Control.Handler ->
+  # Hq.Spawner -- and asserts it lands on `pane.split` as `target_pane_id`,
+  # rather than hand-writing "pane_id" into spawner args (a hand-written
+  # value can't catch the wiring between decorate/1 and the spawner ever
+  # breaking).
+  test "hq spawn's fallback split targets the caller's own pane, driven through decorate/1",
+       %{fake: fake} do
+    FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
+
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "process_info" => %{
+        "foreground_processes" => [%{"name" => "zsh", "pid" => 999}],
+        "shell_pid" => 999
+      }
+    })
+
+    FakeHerdr.stub(fake, "pane.split", %{
+      "type" => "pane_split",
+      "pane" => %{"pane_id" => "w1:p2"}
+    })
+
+    FakeHerdr.stub(fake, "agent.start", %{
+      "type" => "agent_start",
+      "agent" => %{"name" => "worker-z"}
+    })
+
+    System.put_env("HERDR_PANE_ID", "w3:p1")
+    on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+    {verb, args} = Hq.CLI.parse(["spawn", "worker-z", "--cwd", "/tmp/x"])
+    args = Hq.CLI.decorate(args)
+    assert args["pane_id"] == "w3:p1", "decorate/1 must attach the caller's own pane"
+
+    assert :ok = Hq.CLI.require_pane(verb)
+    assert {:ok, %{"name" => "worker-z"}} = Hq.CLI.request(verb, args)
+
+    split = FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == "pane.split"))
+    assert split["params"]["target_pane_id"] == "w3:p1"
+    refute split["params"]["workspace_id"]
+  end
+
   # When the calling pane has no supervised session (e.g. the operator's own
   # pane, never `hq register`ed), the pane id must fall back to "operator"
   # rather than reach Hq.Spawner as a raw, un-lookupable pane id.

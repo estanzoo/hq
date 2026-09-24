@@ -85,6 +85,20 @@ defmodule Hq.SpawnerTest do
     assert Hq.Session.alive?("worker-a")
   end
 
+  # A spawn invoked with no caller pane at all (e.g. from a shell outside
+  # Herdr, so `decorate/1` never attached "pane_id") has nothing to target:
+  # today's behaviour (an untargeted split) is exactly what should happen,
+  # not a crash and not a stray target_pane_id.
+  test "no caller pane: the fallback split carries neither target_pane_id nor workspace_id",
+       %{fake: fake} do
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
+
+    params = call(fake, "pane.split")["params"]
+    refute params["target_pane_id"]
+    refute params["workspace_id"]
+  end
+
   # -- --cwd pointed at an existing worktree (no --worktree) -----------------
   #
   # skills/hq/SKILL.md's "Ordered tasks sharing a branch" workflow spawns the
@@ -145,6 +159,33 @@ defmodule Hq.SpawnerTest do
     assert call(fake, "pane.split")["params"]["workspace_id"] == "w-linked"
     refute "worktree.open" in methods(fake)
     assert Hq.Session.alive?("worker-a")
+  end
+
+  # Precedence: when the split targets an already-open worktree workspace,
+  # the caller's own pane must NOT also be passed as `target_pane_id` --
+  # doing so would drag the worker back into the orchestrator's workspace,
+  # undoing the whole point of splitting into the worktree's workspace in
+  # the first place. `args["pane_id"]` is hand-written here (rather than
+  # driven through `Hq.CLI.decorate/1`, as the sibling fallback test in
+  # cli_test.exs does) because this test is exercising Hq.Spawner's own
+  # precedence logic, not the decorate/1 -> spawner wiring.
+  test "an OPEN worktree workspace: omits target_pane_id even when the caller has a pane",
+       %{fake: fake} do
+    worktree_path = unique_worktree_path()
+
+    worktree_list_stub(fake, [worktree_entry(worktree_path, open_workspace_id: "w-linked")])
+
+    assert {:ok, %{"pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => worktree_path,
+               "pane_id" => "w9:p9"
+             })
+
+    params = call(fake, "pane.split")["params"]
+    assert params["workspace_id"] == "w-linked"
+    refute params["target_pane_id"]
   end
 
   test "a CLOSED worktree workspace: opens it and lands the agent in its root pane",
