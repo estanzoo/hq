@@ -232,9 +232,15 @@ defmodule Hq.CLITest do
       }
     })
 
-    FakeHerdr.stub(fake, "pane.split", %{
-      "type" => "pane_split",
-      "pane" => %{"pane_id" => "w1:p2"}
+    FakeHerdr.stub(fake, "pane.get", %{
+      "type" => "pane_info",
+      "pane" => %{"pane_id" => "w1:p1", "workspace_id" => "w-boss"}
+    })
+
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{"pane_id" => "w1:p2"}
     })
 
     FakeHerdr.stub(fake, "agent.start", %{
@@ -261,21 +267,24 @@ defmodule Hq.CLITest do
     refute Hq.Session.info("worker-x")["spawned_by"] == "w1:p1"
   end
 
-  # The bug this test guards: Hq.Spawner's fallback `pane.split` (no worktree
-  # workspace to target) omitted a split target entirely, so Herdr's own
-  # documented fallback ("uses the calling pane when HERDR_PANE_ID is
-  # available, otherwise the focused pane") took over -- except hq talks to
-  # Herdr over the raw socket with no pane context of its own, so the split
-  # actually landed beside whatever pane the USER happened to have focused at
-  # that instant. `decorate/1` already stamps every request's args with
-  # `"pane_id"` (the caller's own pane, see the comment on
+  # The bug this test guards: Hq.Spawner's fallback used to omit a split
+  # target entirely, so Herdr's own documented fallback ("uses the calling
+  # pane when HERDR_PANE_ID is available, otherwise the focused pane") took
+  # over -- except hq talks to Herdr over the raw socket with no pane context
+  # of its own, so it actually landed beside whatever pane the USER happened
+  # to have focused at that instant. hq no longer splits at all: it opens a
+  # new TAB, and the fallback must resolve the caller's own workspace via
+  # `pane.get` and target THAT explicitly, for exactly the same reason --
+  # an untargeted `tab.create` has the identical scattering risk an
+  # untargeted split did. `decorate/1` already stamps every request's args
+  # with `"pane_id"` (the caller's own pane, see the comment on
   # `Hq.Control.Handler.handle/1`); this drives that value through the REAL
   # pipeline -- parse -> decorate -> request -> Hq.Control.Handler ->
-  # Hq.Spawner -- and asserts it lands on `pane.split` as `target_pane_id`,
+  # Hq.Spawner -- and asserts it lands on `tab.create`'s `workspace_id`,
   # rather than hand-writing "pane_id" into spawner args (a hand-written
   # value can't catch the wiring between decorate/1 and the spawner ever
   # breaking).
-  test "hq spawn's fallback split targets the caller's own pane, driven through decorate/1",
+  test "hq spawn's fallback resolves the caller's workspace via pane.get and opens the tab there, driven through decorate/1",
        %{fake: fake} do
     FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
 
@@ -286,9 +295,15 @@ defmodule Hq.CLITest do
       }
     })
 
-    FakeHerdr.stub(fake, "pane.split", %{
-      "type" => "pane_split",
-      "pane" => %{"pane_id" => "w1:p2"}
+    FakeHerdr.stub(fake, "pane.get", %{
+      "type" => "pane_info",
+      "pane" => %{"pane_id" => "w3:p1", "workspace_id" => "w-caller"}
+    })
+
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{"pane_id" => "w1:p2"}
     })
 
     FakeHerdr.stub(fake, "agent.start", %{
@@ -306,9 +321,15 @@ defmodule Hq.CLITest do
     assert :ok = Hq.CLI.require_pane(verb)
     assert {:ok, %{"name" => "worker-z"}} = Hq.CLI.request(verb, args)
 
-    split = FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == "pane.split"))
-    assert split["params"]["target_pane_id"] == "w3:p1"
-    refute split["params"]["workspace_id"]
+    refute Enum.any?(FakeHerdr.calls(fake), &(&1["method"] == "pane.split")),
+           "hq must never pane.split -- every spawn gets its own tab"
+
+    get = FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == "pane.get"))
+    assert get["params"]["pane_id"] == "w3:p1"
+
+    tab = FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == "tab.create"))
+    assert tab["params"]["workspace_id"] == "w-caller"
+    assert tab["params"]["label"] == "worker-z"
   end
 
   # When the calling pane has no supervised session (e.g. the operator's own
@@ -326,9 +347,15 @@ defmodule Hq.CLITest do
       }
     })
 
-    FakeHerdr.stub(fake, "pane.split", %{
-      "type" => "pane_split",
-      "pane" => %{"pane_id" => "w1:p2"}
+    FakeHerdr.stub(fake, "pane.get", %{
+      "type" => "pane_info",
+      "pane" => %{"pane_id" => "w9:p9", "workspace_id" => "w-operator"}
+    })
+
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{"pane_id" => "w1:p2"}
     })
 
     FakeHerdr.stub(fake, "agent.start", %{

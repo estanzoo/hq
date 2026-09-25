@@ -28,7 +28,7 @@ defmodule Hq.Spawner do
   # sleeps, without ever blocking a pane that is already available.
   @pane_busy_attempts 8
 
-  # Herdr's pane.split / worktree.create returns as soon as the pane exists,
+  # Herdr's tab.create / worktree.create returns as soon as the pane exists,
   # not once its shell is usable: a fresh zsh still runs its own startup
   # (.zprofile's path_helper, etc.) for roughly half a second afterwards. In
   # that window `pane.process_info` reports more than one foreground
@@ -177,36 +177,38 @@ defmodule Hq.Spawner do
   # directory, but wrong for the documented "ordered tasks sharing a branch"
   # workflow (skills/hq/SKILL.md): later tasks are spawned with `--cwd
   # <path>` pointing at a worktree the FIRST task already created with
-  # `--worktree`. Splitting in the caller's workspace strands those agents
-  # visually in the orchestrator's workspace instead of the worktree's own —
-  # confusing, and broken once the first worker's workspace is closed.
+  # `--worktree`. Opening the tab in the caller's workspace strands those
+  # agents visually in the orchestrator's workspace instead of the
+  # worktree's own — confusing, and broken once the first worker's
+  # workspace is closed.
   #
   # So: look up whether `cwd` names a linked worktree Herdr already knows
-  # about, and if so place the pane in ITS workspace (opening it first if
+  # about, and if so place the new tab in ITS workspace (opening it first if
   # it's not currently open) instead of the caller's. This is a placement
-  # nicety layered on top of the existing split, not a replacement for it —
-  # any failure of the lookup or the open falls back to exactly the old
-  # behaviour (split_pane/2) rather than failing the spawn.
+  # nicety layered on top of the tab-per-agent policy below, not a
+  # replacement for it — any failure of the lookup or the open falls back
+  # to a tab in the caller's own workspace rather than failing the spawn.
   #
   # `caller_pane_id` is `args["pane_id"]` -- the caller's own pane, stamped
   # by `Hq.CLI.decorate/1` and carried through untouched by
-  # `Hq.Control.Handler.resolve_from/1` (which only rewrites "from"). Herdr's
-  # own docs (`herdr --skill`) say an omitted `pane.split` target "uses the
-  # calling pane when HERDR_PANE_ID is available, otherwise the focused
-  # pane" -- but hq talks to Herdr over the raw socket with no pane context
-  # of its own, so every untargeted split used to land beside whatever pane
-  # the USER happened to have focused at that instant, scattering workers
-  # across whichever run the user was last looking at. Passing the caller's
-  # own pane as `target_pane_id` on the fallback split fixes that. It is
-  # deliberately NOT passed alongside `workspace_id` (see split_pane/2):
-  # targeting the orchestrator's pane there would drag the worker back into
-  # the orchestrator's workspace, undoing the workspace_id placement above.
-  defp make_pane(_name, args, cwd) do
+  # `Hq.Control.Handler.resolve_from/1` (which only rewrites "from"). hq
+  # never issues `pane.split` any more: every agent gets its own Herdr TAB
+  # (tmux-style window; `prefix+c` new, `prefix+n`/`prefix+p` to step
+  # through) instead of a pane squeezed narrower by each new split, and once
+  # a pane is closed there is nothing left to navigate back to. An untargeted
+  # `tab.create` lands in whatever workspace is currently FOCUSED -- hq talks
+  # to Herdr over the raw socket with no pane context of its own, so that
+  # would scatter workers across whichever run the user was last looking at,
+  # exactly the bug commit 6e09909 already fixed once for splits. So the
+  # fallback resolves the caller's own workspace explicitly via `pane.get`
+  # (see `fallback_tab/3`) rather than leaving it to Herdr's focus-based
+  # default.
+  defp make_pane(name, args, cwd) do
     caller_pane_id = Map.get(args, "pane_id")
 
     case cwd && linked_worktree(cwd) do
       %{"open_workspace_id" => workspace_id} when is_binary(workspace_id) ->
-        split_pane(cwd, workspace_id: workspace_id)
+        create_tab(name, cwd, workspace_id: workspace_id)
 
       %{"path" => path} ->
         case open_worktree_pane(cwd, path) do
@@ -215,30 +217,30 @@ defmodule Hq.Spawner do
 
           {:error, reason} ->
             Logger.debug(
-              "hq: worktree.open failed for #{path}, falling back to a plain split: " <>
-                inspect(reason)
+              "hq: worktree.open failed for #{path}, falling back to a tab in the " <>
+                "caller's workspace: " <> inspect(reason)
             )
 
-            split_pane(cwd, target_pane_id: caller_pane_id)
+            fallback_tab(name, cwd, caller_pane_id)
         end
 
       _ ->
-        split_pane(cwd, target_pane_id: caller_pane_id)
+        fallback_tab(name, cwd, caller_pane_id)
     end
   end
 
   # Finds the entry in `worktree.list` whose path matches `cwd`, but only
   # among LINKED worktrees: the primary checkout appears in this same list
-  # (`is_linked_worktree: false`) and must keep splitting in the caller's
-  # workspace exactly as before — it is not the "nested under the primary
-  # repo" case this feature exists for.
+  # (`is_linked_worktree: false`) and must keep opening its tab in the
+  # caller's workspace exactly as before — it is not the "nested under the
+  # primary repo" case this feature exists for.
   #
   # `cwd` can arrive with a symlinked or non-canonical prefix (macOS
   # `/var` vs `/private/var`, a trailing slash, ...), so both sides are run
   # through `Path.expand/1` before comparing. Any failure here — the call
   # errors, or the response is not shaped as expected — is logged and
-  # treated as "no match", which routes the caller straight to the old
-  # split behaviour; this lookup must never be the reason a spawn fails.
+  # treated as "no match", which routes the caller straight to the fallback
+  # tab; this lookup must never be the reason a spawn fails.
   defp linked_worktree(cwd) do
     case Hq.Herdr.call("worktree.list", %{"cwd" => cwd}) do
       {:ok, %{"worktrees" => worktrees}} when is_list(worktrees) ->
@@ -256,7 +258,8 @@ defmodule Hq.Spawner do
 
       {:error, reason} ->
         Logger.debug(
-          "hq: worktree.list failed, falling back to a plain split: " <> inspect(reason)
+          "hq: worktree.list failed, falling back to a tab in the caller's workspace: " <>
+            inspect(reason)
         )
 
         nil
@@ -265,8 +268,8 @@ defmodule Hq.Spawner do
 
   # `worktree.open`'s response carries a `root_pane` (required per the API
   # schema) for the workspace it opened or focused — prefer that directly
-  # over an extra `pane.split` call rather than opening the workspace and
-  # then splitting a second pane inside it.
+  # over an extra `tab.create` call rather than opening the workspace and
+  # then opening a second tab inside it.
   defp open_worktree_pane(cwd, path) do
     case Hq.Herdr.call("worktree.open", %{"path" => path, "focus" => false}) do
       {:ok, %{"root_pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
@@ -275,28 +278,71 @@ defmodule Hq.Spawner do
     end
   end
 
-  # The plain `pane.split` this branch always did. `:workspace_id`, when
-  # given, scopes the split to an already-open worktree workspace found by
-  # `linked_worktree/1`. `:target_pane_id`, when given, is the CALLER's own
-  # pane (see the comment on `make_pane/3` above) and makes the split land
-  # beside whoever asked for the spawn instead of an untargeted split
-  # drifting to whatever pane the user happens to have focused.
+  # Resolves the caller's own workspace and opens the agent's tab there,
+  # rather than an untargeted `tab.create` that would land wherever the user
+  # currently has focused (see the comment on `make_pane/3`). Herdr documents
+  # pane ids as opaque, so the workspace is looked up with `pane.get` rather
+  # than parsed out of `caller_pane_id` itself.
   #
-  # The two are mutually exclusive by construction, not by caller
-  # discipline: `workspace_id` already places the split inside the
-  # worktree's own workspace, so a `target_pane_id` pointing at the
-  # orchestrator's pane (which lives in a DIFFERENT workspace) would drag the
-  # worker back out of it. Enforcing that here, in the one function that
-  # builds `pane.split`'s params, means no call site has to remember the
-  # precedence itself.
-  defp split_pane(cwd, opts) do
-    workspace_id = Keyword.get(opts, :workspace_id)
-    target_pane_id = if workspace_id, do: nil, else: Keyword.get(opts, :target_pane_id)
+  # With no caller pane at all (`caller_pane_id` is `nil` -- spawned from a
+  # shell outside Herdr, so `Hq.CLI.decorate/1` never attached one), there is
+  # nothing to resolve: the tab opens untargeted, exactly Herdr's own
+  # documented fallback, because there is nothing better to target.
+  #
+  # If `pane.get` itself fails, this does NOT fall through to an untargeted
+  # tab -- that has the same scattering risk an untargeted `tab.create` always
+  # has. It falls back instead to the pre-tab behaviour, a `pane.split`
+  # targeting the caller's own pane directly, so the agent still lands beside
+  # its orchestrator rather than beside whatever the user happens to be
+  # looking at.
+  defp fallback_tab(name, cwd, nil), do: create_tab(name, cwd, [])
 
+  defp fallback_tab(name, cwd, caller_pane_id) do
+    case Hq.Herdr.call("pane.get", %{"pane_id" => caller_pane_id}) do
+      {:ok, %{"pane" => %{"workspace_id" => workspace_id}}} when is_binary(workspace_id) ->
+        create_tab(name, cwd, workspace_id: workspace_id)
+
+      other ->
+        Logger.debug(
+          "hq: pane.get failed for the caller's pane #{caller_pane_id}, falling back to a " <>
+            "split targeting it directly: " <> inspect(other)
+        )
+
+        split_pane(cwd, caller_pane_id)
+    end
+  end
+
+  # Every agent gets its own tab (see `make_pane/3`) rather than a pane
+  # split off an existing one. `:workspace_id`, when given, is either an
+  # already-open worktree workspace (`linked_worktree/1`) or the caller's own
+  # workspace as resolved by `fallback_tab/3`; omitted, Herdr opens the tab
+  # untargeted (only the no-caller-pane case reaches this). `label` is the
+  # agent's name, so the tab bar reads e.g. `ev-limit-2` instead of a generic
+  # "Tab 3". `focus: false` so a spawn never steals the user's focus.
+  defp create_tab(name, cwd, opts) do
+    workspace_id = Keyword.get(opts, :workspace_id)
+
+    params =
+      %{"label" => name, "focus" => false}
+      |> maybe_put("cwd", cwd)
+      |> maybe_put("workspace_id", workspace_id)
+
+    case Hq.Herdr.call("tab.create", params) do
+      {:ok, %{"root_pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
+      {:ok, other} -> {:error, {:no_pane_in_response, other}}
+      error -> error
+    end
+  end
+
+  # The one remaining `pane.split` call site: `pane.get` on the caller's own
+  # pane failed (see `fallback_tab/3`), so there is no workspace to resolve
+  # and open a tab in. Falls back to the pre-tab behaviour -- split beside
+  # the caller's own pane -- rather than an untargeted split that could land
+  # beside whatever pane the user happens to have focused.
+  defp split_pane(cwd, target_pane_id) do
     params =
       %{"direction" => "right", "focus" => false}
       |> maybe_put("cwd", cwd)
-      |> maybe_put("workspace_id", workspace_id)
       |> maybe_put("target_pane_id", target_pane_id)
 
     case Hq.Herdr.call("pane.split", params) do
@@ -322,10 +368,10 @@ defmodule Hq.Spawner do
   #
   # The script itself always lives in the SOURCE checkout (`cwd`), but it
   # must run AGAINST the directory the agent will actually work in
-  # (`target_dir`): for a plain pane.split those are the same directory, but
-  # for a worktree spawn they are not — running it against `cwd` instead of
-  # the new worktree derives ports for the wrong checkout and defeats the
-  # reason this step exists.
+  # (`target_dir`): for a plain tab those are the same directory, but for a
+  # worktree spawn they are not — running it against `cwd` instead of the
+  # new worktree derives ports for the wrong checkout and defeats the reason
+  # this step exists.
   defp prepare_env(pane_id, cwd, target_dir) do
     script = cwd && Path.join(cwd, "tools/worktree-env.sh")
 

@@ -33,9 +33,18 @@ defmodule Hq.SpawnerTest do
       "agent" => %{"name" => "worker-a"}
     })
 
+    # hq no longer issues pane.split in any of its normal paths -- this stub
+    # exists only for the one remaining call site, the pane.get-failure
+    # fallback (see "a pane.get failure ..." below), and is otherwise unused.
     FakeHerdr.stub(fake, "pane.split", %{
       "type" => "pane_split",
       "pane" => %{"pane_id" => "w1:p2"}
+    })
+
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{"pane_id" => "w1:p2"}
     })
 
     FakeHerdr.stub(fake, "worktree.create", %{
@@ -76,27 +85,57 @@ defmodule Hq.SpawnerTest do
   defp methods(fake), do: FakeHerdr.calls(fake) |> Enum.map(& &1["method"])
   defp call(fake, m), do: FakeHerdr.calls(fake) |> Enum.find(&(&1["method"] == m))
 
-  test "splits a pane when no worktree is asked for", %{fake: fake} do
+  test "opens a tab when no worktree is asked for", %{fake: fake} do
     assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
-    assert "pane.split" in methods(fake)
+    assert "tab.create" in methods(fake)
+    refute "pane.split" in methods(fake)
     refute "worktree.create" in methods(fake)
     assert Hq.Session.alive?("worker-a")
   end
 
   # A spawn invoked with no caller pane at all (e.g. from a shell outside
   # Herdr, so `decorate/1` never attached "pane_id") has nothing to target:
-  # today's behaviour (an untargeted split) is exactly what should happen,
-  # not a crash and not a stray target_pane_id.
-  test "no caller pane: the fallback split carries neither target_pane_id nor workspace_id",
+  # today's behaviour (an untargeted tab.create) is exactly what should
+  # happen, not a crash and not a stray workspace_id -- and, per the user's
+  # actual requirement, never a pane.split.
+  test "no caller pane: the fallback tab.create is untargeted (no workspace_id)",
        %{fake: fake} do
     assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
-    params = call(fake, "pane.split")["params"]
-    refute params["target_pane_id"]
+    refute "pane.split" in methods(fake)
+    params = call(fake, "tab.create")["params"]
+    assert params["label"] == "worker-a"
     refute params["workspace_id"]
+  end
+
+  # A caller pane IS present but Herdr's `pane.get` fails to resolve it to a
+  # workspace (e.g. the pane vanished, or a transient error). This must NOT
+  # fall through to an untargeted tab.create -- that has exactly the
+  # scattering risk this whole feature exists to avoid -- but fall back to
+  # the pre-tab behaviour instead: a pane.split targeting the caller's own
+  # pane directly, so the agent still lands beside its orchestrator.
+  # `args["pane_id"]` is hand-written here (as in the sibling precedence
+  # test above) because this exercises Hq.Spawner's own fallback logic, not
+  # the decorate/1 -> spawner wiring -- that pipeline is covered separately
+  # in cli_test.exs.
+  test "a pane.get failure falls back to a split targeting the caller's pane (NOT an untargeted tab)",
+       %{fake: fake} do
+    FakeHerdr.stub_error(fake, "pane.get", %{"code" => "not_found", "message" => "no such pane"})
+
+    assert {:ok, %{"name" => "worker-a", "pane_id" => "w1:p2"}} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-a",
+               "from" => "boss",
+               "cwd" => "/tmp/x",
+               "pane_id" => "w3:p1"
+             })
+
+    refute "tab.create" in methods(fake)
+    assert call(fake, "pane.split")["params"]["target_pane_id"] == "w3:p1"
+    assert Hq.Session.alive?("worker-a")
   end
 
   # -- --cwd pointed at an existing worktree (no --worktree) -----------------
@@ -141,7 +180,8 @@ defmodule Hq.SpawnerTest do
     Path.join(System.tmp_dir!(), "hq-worktree-#{System.unique_integer([:positive])}")
   end
 
-  test "an OPEN worktree workspace: splits with that workspace's workspace_id", %{fake: fake} do
+  test "an OPEN worktree workspace: opens a tab with that workspace's workspace_id and the agent's name as label",
+       %{fake: fake} do
     worktree_path = unique_worktree_path()
 
     worktree_list_stub(fake, [
@@ -156,20 +196,23 @@ defmodule Hq.SpawnerTest do
                "cwd" => worktree_path
              })
 
-    assert call(fake, "pane.split")["params"]["workspace_id"] == "w-linked"
+    params = call(fake, "tab.create")["params"]
+    assert params["workspace_id"] == "w-linked"
+    assert params["label"] == "worker-a"
     refute "worktree.open" in methods(fake)
+    refute "pane.split" in methods(fake)
     assert Hq.Session.alive?("worker-a")
   end
 
-  # Precedence: when the split targets an already-open worktree workspace,
-  # the caller's own pane must NOT also be passed as `target_pane_id` --
-  # doing so would drag the worker back into the orchestrator's workspace,
-  # undoing the whole point of splitting into the worktree's workspace in
+  # Precedence: when the tab targets an already-open worktree workspace, the
+  # caller's own pane must not be resolved (or consulted) at all -- doing so
+  # would risk dragging the worker back into the orchestrator's workspace,
+  # undoing the whole point of opening the tab in the worktree's workspace in
   # the first place. `args["pane_id"]` is hand-written here (rather than
   # driven through `Hq.CLI.decorate/1`, as the sibling fallback test in
   # cli_test.exs does) because this test is exercising Hq.Spawner's own
   # precedence logic, not the decorate/1 -> spawner wiring.
-  test "an OPEN worktree workspace: omits target_pane_id even when the caller has a pane",
+  test "an OPEN worktree workspace: never resolves the caller's own pane via pane.get",
        %{fake: fake} do
     worktree_path = unique_worktree_path()
 
@@ -183,9 +226,8 @@ defmodule Hq.SpawnerTest do
                "pane_id" => "w9:p9"
              })
 
-    params = call(fake, "pane.split")["params"]
-    assert params["workspace_id"] == "w-linked"
-    refute params["target_pane_id"]
+    assert call(fake, "tab.create")["params"]["workspace_id"] == "w-linked"
+    refute "pane.get" in methods(fake)
   end
 
   test "a CLOSED worktree workspace: opens it and lands the agent in its root pane",
@@ -240,7 +282,8 @@ defmodule Hq.SpawnerTest do
 
     assert "worktree.list" in methods(fake)
     refute "worktree.open" in methods(fake)
-    refute call(fake, "pane.split")["params"]["workspace_id"]
+    refute "pane.split" in methods(fake)
+    refute call(fake, "tab.create")["params"]["workspace_id"]
   end
 
   test "does not route through the primary checkout's own workspace_id", %{fake: fake} do
@@ -251,10 +294,10 @@ defmodule Hq.SpawnerTest do
     assert {:ok, %{"pane_id" => "w1:p2"}} =
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
-    refute call(fake, "pane.split")["params"]["workspace_id"]
+    refute call(fake, "tab.create")["params"]["workspace_id"]
   end
 
-  test "a failing worktree.list falls back to a plain split and the spawn still succeeds",
+  test "a failing worktree.list falls back to a tab and the spawn still succeeds",
        %{fake: fake} do
     FakeHerdr.stub_error(fake, "worktree.list", %{"code" => "internal_error", "message" => "boom"})
 
@@ -262,10 +305,11 @@ defmodule Hq.SpawnerTest do
              Hq.Spawner.spawn_agent(%{"name" => "worker-a", "from" => "boss", "cwd" => "/tmp/x"})
 
     assert Hq.Session.alive?("worker-a")
-    refute call(fake, "pane.split")["params"]["workspace_id"]
+    refute "pane.split" in methods(fake)
+    refute call(fake, "tab.create")["params"]["workspace_id"]
   end
 
-  test "a failing worktree.open falls back to a plain split and the spawn still succeeds",
+  test "a failing worktree.open falls back to a tab and the spawn still succeeds",
        %{fake: fake} do
     worktree_path = unique_worktree_path()
 
@@ -279,8 +323,9 @@ defmodule Hq.SpawnerTest do
                "cwd" => worktree_path
              })
 
-    assert call(fake, "pane.split")["params"]["cwd"] == worktree_path
-    refute call(fake, "pane.split")["params"]["workspace_id"]
+    refute "pane.split" in methods(fake)
+    assert call(fake, "tab.create")["params"]["cwd"] == worktree_path
+    refute call(fake, "tab.create")["params"]["workspace_id"]
   end
 
   test "matches a worktree path even when cwd carries a cosmetic difference", %{fake: fake} do
@@ -295,7 +340,7 @@ defmodule Hq.SpawnerTest do
                "cwd" => worktree_path <> "/"
              })
 
-    assert call(fake, "pane.split")["params"]["workspace_id"] == "w-linked"
+    assert call(fake, "tab.create")["params"]["workspace_id"] == "w-linked"
   end
 
   test "creates a worktree when asked", %{fake: fake} do
@@ -614,5 +659,47 @@ defmodule Hq.SpawnerTest do
 
     assert first_check < first_input,
            "the pane's readiness must be checked before any input is written into it"
+  end
+
+  # The user's actual requirement, stated directly: panes were getting
+  # squeezed narrower with every spawn, and once closed there was no way
+  # back to them. hq must never call pane.split in any of its NORMAL paths
+  # -- only the pane.get-failure fallback (covered separately above) still
+  # does, and that is not exercised here. Each of these three scenarios
+  # covers one row of the make_pane/3 table: an open worktree workspace, the
+  # caller-workspace fallback (with a caller pane present), and no caller
+  # pane at all.
+  test "no pane.split is issued in any normal path", %{fake: fake} do
+    worktree_path = unique_worktree_path()
+    worktree_list_stub(fake, [worktree_entry(worktree_path, open_workspace_id: "w-linked")])
+
+    FakeHerdr.stub(fake, "pane.get", %{
+      "type" => "pane_info",
+      "pane" => %{"pane_id" => "w3:p1", "workspace_id" => "w-caller"}
+    })
+
+    assert {:ok, _} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-open",
+               "from" => "boss",
+               "cwd" => worktree_path
+             })
+
+    assert {:ok, _} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-fallback",
+               "from" => "boss",
+               "cwd" => "/tmp/x",
+               "pane_id" => "w3:p1"
+             })
+
+    assert {:ok, _} =
+             Hq.Spawner.spawn_agent(%{
+               "name" => "worker-no-caller",
+               "from" => "boss",
+               "cwd" => "/tmp/x"
+             })
+
+    refute "pane.split" in methods(fake)
   end
 end
