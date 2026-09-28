@@ -187,12 +187,35 @@ defmodule Hq.Control.Handler do
     if Regex.match?(@name_re, from) do
       args
     else
-      case Enum.find(Hq.SessionSup.list(), &(&1["pane_id"] == from)) do
-        %{"name" => name} -> Map.put(args, "from", name)
-        nil -> Map.put(args, "from", "operator")
+      case Enum.filter(Hq.SessionSup.list(), &(&1["pane_id"] == from)) do
+        [] -> Map.put(args, "from", "operator")
+        [%{"name" => name}] -> Map.put(args, "from", name)
+        candidates -> Map.put(args, "from", resolve_pane_conflict(candidates, from))
       end
     end
   end
 
   defp resolve_from(args), do: args
+
+  # A pane hosts exactly one agent, so more than one supervised session
+  # claiming the same pane_id here means hq's own bookkeeping has drifted
+  # from reality. `Hq.Roster.adopt/3`'s eviction (see its moduledoc) is
+  # supposed to make this impossible by forgetting any other claimant the
+  # moment a pane is (re)registered or (re)adopted -- this is the last line
+  # of defense for whatever it doesn't catch. Blindly taking the first match
+  # (as this used to) is exactly the bug that sent a spawned worker's
+  # completion report to a dead orchestrator instead of the live one
+  # actually occupying the pane. Ask Herdr who is there right now instead,
+  # and prefer that name; if Herdr can't be reached, or names someone not
+  # among our own candidates, do not guess — fall back to "operator" rather
+  # than ever picking a session Herdr says is not there.
+  defp resolve_pane_conflict(candidates, pane_id) do
+    case Hq.Herdr.call("agent.get", %{"target" => pane_id}) do
+      {:ok, %{"agent" => %{"name" => name}}} when is_binary(name) ->
+        if Enum.any?(candidates, &(&1["name"] == name)), do: name, else: "operator"
+
+      _ ->
+        "operator"
+    end
+  end
 end

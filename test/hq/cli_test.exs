@@ -212,6 +212,81 @@ defmodule Hq.CLITest do
     assert rename["params"] == %{"target" => "w1:p1", "name" => "boss"}
   end
 
+  # Bug 1: an orchestrator (`ev-limit`) exits but its pane (`wQ:p1`) stays
+  # open (this is exactly the ghost bug 2 elsewhere in this task exists to
+  # catch), the user starts a fresh orchestrator there and runs `hq register
+  # sw-desktop`, and a worker spawned from that same pane must be told to
+  # report to `sw-desktop`, not to the still-remembered, now-dead `ev-limit`.
+  # Before the eviction fix, both entries claimed `wQ:p1` in sessions.json and
+  # `Hq.Control.Handler.resolve_from/1` (via `Hq.SessionSup.list/0`) found
+  # `ev-limit` first, so the spawned worker's `spawned_by` -- and thus the
+  # "report to" instruction baked into its preamble -- pointed at a session
+  # that could never receive it.
+  #
+  # Driven through the real `parse -> decorate -> request -> handler`
+  # pipeline for BOTH the register and the spawn, exactly as the brief
+  # requires: hand-writing "from" => "sw-desktop" here would prove nothing
+  # about the eviction/resolution wiring actually fixing the misroute.
+  test "registering a pane already claimed by another session evicts it, so a later spawn from that pane reports to the NEW name",
+       %{fake: fake} do
+    FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
+
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "process_info" => %{
+        "foreground_processes" => [%{"name" => "zsh", "pid" => 999}],
+        "shell_pid" => 999
+      }
+    })
+
+    FakeHerdr.stub(fake, "pane.get", %{
+      "type" => "pane_info",
+      "pane" => %{"pane_id" => "wQ:p1", "workspace_id" => "w-desktop"}
+    })
+
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "tab" => %{"tab_id" => "t1"},
+      "root_pane" => %{"pane_id" => "wS:p1"}
+    })
+
+    FakeHerdr.stub(fake, "agent.start", %{
+      "type" => "agent_start",
+      "agent" => %{"name" => "sw-desktop-1"}
+    })
+
+    # The stale session: its orchestrator exited but hq never reaped it (the
+    # scenario bug 2 covers), so it still claims wQ:p1 when the user
+    # registers a fresh orchestrator there.
+    {:ok, _} = Hq.Roster.adopt("ev-limit", "wQ:p1")
+
+    System.put_env("HERDR_PANE_ID", "wQ:p1")
+    on_exit(fn -> System.delete_env("HERDR_PANE_ID") end)
+
+    {reg_verb, reg_args} = Hq.CLI.parse(["register", "sw-desktop"])
+    reg_args = Hq.CLI.decorate(reg_args)
+    assert :ok = Hq.CLI.require_pane(reg_verb)
+
+    assert {:ok, %{"name" => "sw-desktop", "pane_id" => "wQ:p1"}} =
+             Hq.CLI.request(reg_verb, reg_args)
+
+    assert Hq.Session.alive?("sw-desktop")
+    refute Hq.Session.alive?("ev-limit"), "the stale session must be evicted, not left dangling"
+
+    names = Hq.Roster.remembered() |> Enum.map(& &1["name"])
+    assert names == ["sw-desktop"], "ev-limit must no longer be remembered either"
+
+    {spawn_verb, spawn_args} = Hq.CLI.parse(["spawn", "sw-desktop-1"])
+    spawn_args = Hq.CLI.decorate(spawn_args)
+    assert spawn_args["from"] == "wQ:p1", "decorate/1 must still attach the raw pane id"
+
+    assert {:ok, %{"name" => "sw-desktop-1"}} = Hq.CLI.request(spawn_verb, spawn_args)
+
+    assert Hq.Session.info("sw-desktop-1")["spawned_by"] == "sw-desktop"
+
+    refute Hq.Session.info("sw-desktop-1")["spawned_by"] == "ev-limit",
+           "the spawned worker must not be told to report to the dead session"
+  end
+
   # C2: `decorate/1` stamps "from" with the raw pane id ($HERDR_PANE_ID), e.g.
   # "w1:p1" — every downstream consumer of `spawned_by` (Hq.Spawner,
   # Hq.Session, Hq.Notify) expects a session NAME instead, so a pane id
