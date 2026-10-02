@@ -4,6 +4,7 @@ defmodule Hq.Control.Handler do
 
   Pure request-in, response-out so the verbs can be tested without a socket.
   """
+  require Logger
 
   @name_re ~r/^[a-z][a-z0-9_-]{0,31}$/
 
@@ -100,7 +101,18 @@ defmodule Hq.Control.Handler do
     end
   end
 
-  defp do_handle(%{"verb" => "spawn", "args" => args}), do: Hq.Spawner.spawn_agent(args)
+  defp do_handle(%{"verb" => "spawn", "args" => args}) do
+    case Hq.Spawner.spawn_agent(args) do
+      {:ok, %{"name" => name, "pane_id" => pane_id}} = ok ->
+        record_spawn(args["from"], name, pane_id)
+        ok
+
+      other ->
+        other
+    end
+  end
+
+  defp do_handle(%{"verb" => "cleanup", "args" => args}), do: Hq.Cleanup.run(args)
 
   # `hq stop`'s primary, signal-free path -- see the module doc on
   # `Hq.Control` for why `pkill -f 'hq daemon'` (the old advice) is
@@ -150,6 +162,34 @@ defmodule Hq.Control.Handler do
   end
 
   defp live_names, do: Hq.SessionSup.list() |> Enum.map(& &1["name"]) |> Enum.sort()
+
+  # The durable "who spawned what" record `hq cleanup` reads (see
+  # `Hq.Runs`). Recorded here, after the spawn has fully succeeded, rather
+  # than inside `Hq.Spawner`: the worktree path is the new session's own
+  # `cwd`, which only exists once `Hq.Roster.adopt/3` has started it. A spawn
+  # from a pane hq does not supervise resolves to "operator", which is not an
+  # orchestrator anyone can clean up as, so it is not recorded. A failure to
+  # record must never turn a successful spawn into an error: the worker is
+  # still found through its live `spawned_by` while it runs.
+  defp record_spawn(parent, name, pane_id) when is_binary(parent) and parent != "operator" do
+    worktree =
+      try do
+        Hq.Session.info(name)["cwd"]
+      catch
+        :exit, _ -> nil
+      end
+
+    Hq.Runs.record(%{
+      "parent" => parent,
+      "name" => name,
+      "pane_id" => pane_id,
+      "worktree" => worktree
+    })
+  rescue
+    e -> Logger.warning("hq: could not record spawn of #{name}: #{inspect(e)}")
+  end
+
+  defp record_spawn(_parent, _name, _pane_id), do: :ok
 
   # `register` on a taken name used to return `%{"code" => "name_taken",
   # "message" => name}` -- the CLI renders `error["message"]` verbatim, so a

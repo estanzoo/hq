@@ -123,6 +123,36 @@ defmodule Hq.CLI do
     end
   end
 
+  # `hq cleanup` is destructive, so its parse is strict: an unknown flag (a
+  # typo of `--yes`, say) or a stray positional argument is an error rather
+  # than silently dropped -- and a dropped `--keep` would remove something
+  # the user asked to protect. The CLI's own working directory travels with
+  # the request because the daemon's cwd is wherever it happened to start;
+  # the repository is located from the caller's, never the daemon's.
+  def parse(["cleanup" | rest]) do
+    case OptionParser.parse(rest,
+           strict: [yes: :boolean, keep: :keep, include_unrecorded: :boolean]
+         ) do
+      {flags, [], []} ->
+        {"cleanup",
+         %{
+           "yes" => Keyword.get(flags, :yes, false),
+           "include_unrecorded" => Keyword.get(flags, :include_unrecorded, false),
+           "keep" => Keyword.get_values(flags, :keep),
+           "cwd" => File.cwd!()
+         }}
+
+      {_, extra, []} ->
+        {:error,
+         "cleanup: unexpected argument(s): #{Enum.join(extra, " ")}; " <>
+           "expected `hq cleanup [--yes] [--keep <worker-or-dir>]... [--include-unrecorded]`"}
+
+      {_, _, invalid} ->
+        bad = Enum.map_join(invalid, ", ", fn {flag, _} -> flag end)
+        {:error, "cleanup: unknown flag(s): #{bad}"}
+    end
+  end
+
   def parse([verb | _]), do: {verb, %{}}
 
   # -- control socket -------------------------------------------------------
@@ -629,7 +659,7 @@ defmodule Hq.CLI do
   # assert on the `{:error, map()}` directly without going through
   # `System.halt/1`.
   @spec require_pane(String.t()) :: :ok | {:error, map()}
-  def require_pane(verb) when verb in ["register", "inbox"] do
+  def require_pane(verb) when verb in ["register", "inbox", "cleanup"] do
     case System.get_env("HERDR_PANE_ID") do
       nil ->
         {:error,
@@ -637,7 +667,8 @@ defmodule Hq.CLI do
            "code" => "no_pane",
            "message" =>
              "not running inside a Herdr pane ($HERDR_PANE_ID is unset)\n" <>
-               "     `hq register` and `hq inbox` identify your session by its pane.\n" <>
+               "     `hq register`, `hq inbox` and `hq cleanup` identify your session by " <>
+               "its pane.\n" <>
                "     Start this session inside Herdr, or pass an explicit target."
          }}
 
@@ -706,6 +737,8 @@ defmodule Hq.CLI do
     Enum.map_join(pending, "\n", &"#{&1["from"]}: #{&1["body"]}")
   end
 
+  def render("cleanup", result), do: Hq.Cleanup.render(result)
+
   def render(_verb, result), do: JSON.encode!(result)
 
   # A busy session comes back from `Hq.SessionSup.list/0` with
@@ -755,6 +788,16 @@ defmodule Hq.CLI do
       hq ls                           live sessions, status, mailbox depth, parent
       hq inbox                        what is queued for this pane
       hq release <name>               stop supervising (does not kill the agent)
+      hq cleanup [flags]              end of a feature: close this orchestrator's
+                                      worker panes and remove their worktrees.
+                                      DRY RUN unless --yes; prints the plan.
+          --yes                       carry the plan out
+          --keep <worker-or-dir>      protect something extra (repeatable)
+          --include-unrecorded        also consider .worktree/<you>-* worktrees
+                                      matched by name only (legacy runs)
+                                      Never closes your own pane, never deletes
+                                      a branch, keeps any worktree whose branch
+                                      is on origin (the PR), and keeps dirty ones.
       hq stop                         stop the daemon (safe; never pkill/killall)
       hq restart                      stop the daemon, then start a fresh one
       hq daemon                       run the daemon in the foreground

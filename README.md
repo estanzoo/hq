@@ -36,6 +36,9 @@ hq send <name> "<message>"      queue a message; delivered when idle
 hq ls                           live sessions, status, mailbox depth
 hq inbox                        what is queued for this pane
 hq release <name>               stop supervising (does not kill the agent)
+hq cleanup [flags]              close this orchestrator's worker panes and
+                                remove their worktrees (DRY RUN unless --yes)
+    --yes --keep <worker-or-dir> --include-unrecorded
 hq stop                         stop the daemon (safe; never pkill/killall)
 hq restart                      stop the daemon, then start a fresh one
 hq daemon                       run the daemon in the foreground
@@ -53,6 +56,27 @@ to hq. It never uses `pkill` or `killall`: matching by command-line pattern
 across every process on the machine is exactly what those do, and exactly
 what previously took down unrelated terminal sessions and editor processes
 that merely happened to share a substring with the daemon's invocation.
+
+`hq cleanup`, run from an orchestrator's own pane at the end of a feature,
+closes that orchestrator's worker panes and removes their worktrees. Without
+`--yes` it only prints the plan. It finds the workers from a durable spawn
+record (`runs.json` under `~/.hq`) and from live sessions that orchestrator
+spawned. It never closes the orchestrator's own pane and never deletes a
+branch, and it removes worktrees only with plain `git worktree remove`
+(never `--force`). It keeps:
+
+- any worktree whose branch is on `origin`, checked with `git ls-remote`.
+  Workers never push, so that branch is the one pushed for the PR. If origin
+  cannot be reached, local refs decide, and the plan says so.
+- dirty worktrees, the primary checkout and the orchestrator's own worktree.
+- worktrees still in use by another session.
+- anything named in `--keep`.
+- any pane whose agent is not idle, and any pane Herdr will only close with
+  worktree-group confirmation.
+
+If Herdr cannot be reached, nothing is closed and nothing is removed.
+`--include-unrecorded` also considers `.worktree/<orchestrator>-*` worktrees
+from before the record existed, and marks them as matched by name only.
 
 The `skills/hq/` directory installs as a Claude Code skill so an orchestrating
 session can read the workflow itself — see `skills/hq/SKILL.md`.

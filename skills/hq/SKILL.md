@@ -180,7 +180,8 @@ spawn preamble, so you don't need to say "report to `<your-name>`" in `--task`,
 and never tell a worker to message "orchestrator" by that literal name.
 
 Leave finished workers open — they are the record the user reviews, and each
-has its own sidebar entry. The user closes them when done.
+has its own sidebar entry. The user closes them when done, or asks you to
+clean up (step 7).
 
 ### 6. When the epic is done
 
@@ -188,6 +189,43 @@ The task that depends on everything else — directly or through the chain —
 has a branch containing all of the epic's work. **Report which branch that is**
 in your summary to the user. Do not push, open a PR, or move a shared branch
 such as the feature branch; the user decides how it lands.
+
+### 7. Ending a feature: cleanup
+
+Only when the user asks you to clean up — never on your own — close your
+workers' panes and remove their worktrees:
+
+```bash
+hq cleanup          # a DRY RUN: prints the plan, changes nothing
+```
+
+1. Run `hq cleanup` and show the user its plan **verbatim** — every line,
+   including what it keeps and why. Do not summarise it.
+2. Wait for the user's go-ahead.
+3. Then run `hq cleanup --yes` and show the user that output too.
+
+Never add `--yes`, `--include-unrecorded` or `--keep` on your own initiative;
+pass each only when the user asks for it:
+
+- `--keep <worker-or-dir>` protects something extra (repeatable).
+- `--include-unrecorded` also considers `.worktree/<your-name>-*` worktrees
+  from runs older than hq's spawn record. They are matched by name only, so
+  they are marked as such in the plan for the user to check.
+
+What it will and will not do:
+
+- It only touches **your** workers — the ones you spawned. Another
+  orchestrator's run is left alone.
+- It **never closes your own pane**.
+- It **never deletes a branch**. Removing a clean worktree loses nothing;
+  every commit stays on its branch.
+- It **keeps the PR worktree**: any worktree whose branch is on `origin`.
+  Workers never push, so a branch on `origin` is one the user pushed for
+  review.
+- It keeps any worktree that is dirty, still has a working or blocked agent,
+  is in use by another session, or is your own; and any pane whose close
+  Herdr says needs worktree-group confirmation — it never forces one.
+- If Herdr cannot be reached it does nothing at all.
 
 ## Messaging
 
