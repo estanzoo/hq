@@ -211,7 +211,7 @@ defmodule Hq.Spawner do
         create_tab(name, cwd, workspace_id: workspace_id)
 
       %{"path" => path} ->
-        case open_worktree_pane(cwd, path) do
+        case open_worktree_pane(name, cwd, path) do
           {:ok, _pane_id, _target_dir} = ok ->
             ok
 
@@ -270,8 +270,12 @@ defmodule Hq.Spawner do
   # schema) for the workspace it opened or focused — prefer that directly
   # over an extra `tab.create` call rather than opening the workspace and
   # then opening a second tab inside it.
-  defp open_worktree_pane(cwd, path) do
-    case Hq.Herdr.call("worktree.open", %{"path" => path, "focus" => false}) do
+  # Labelled the same way `worktree.create`'s workspaces are. Without a
+  # label, Herdr's sidebar falls back to showing the branch, so a fan-in
+  # task -- whose worktree the orchestrator builds itself and hq then opens
+  # -- read `agent/<name>` while every other worker read `<name>`.
+  defp open_worktree_pane(name, cwd, path) do
+    case Hq.Herdr.call("worktree.open", %{"path" => path, "focus" => false, "label" => name}) do
       {:ok, %{"root_pane" => %{"pane_id" => pane_id}}} -> {:ok, pane_id, cwd}
       {:ok, other} -> {:error, {:no_pane_in_response, other}}
       error -> error

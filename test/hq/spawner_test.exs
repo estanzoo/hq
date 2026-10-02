@@ -270,6 +270,9 @@ defmodule Hq.SpawnerTest do
              })
 
     assert call(fake, "worktree.open")["params"]["path"] == worktree_path
+    # Without a label Herdr's sidebar shows the branch instead, so a fan-in
+    # worker appeared as `agent/<name>` beside every other worker's `<name>`.
+    assert call(fake, "worktree.open")["params"]["label"] == "worker-a"
     refute "pane.split" in methods(fake)
     assert Hq.Session.alive?("worker-a")
   end
