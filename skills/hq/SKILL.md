@@ -140,9 +140,8 @@ a new orchestrator, and its entry may already exist.
 }
 ```
 
-End every worker's `--task` with this sentence, so its session id reaches you:
-*"End your final report with a line `session: ` followed by the output of
-`echo $CLAUDE_CODE_SESSION_ID`."*
+Every worker's `--task` ends with the closing text in step 4 below. Its last
+sentence asks the worker for its session id.
 
 **4. When a worker reports it is done**, `update` its entry with
 `session_id` (from its `session:` line), `"status": "done"`, `finished_at`,
@@ -238,6 +237,18 @@ renamed it, so read it rather than assuming `agent/<name>`:
 git worktree list          # every worktree, with the branch checked out in it
 ```
 
+**End every `--task` with this closing text.** Workers never read this skill,
+so the closing text is how they learn where to take their questions and how
+their session id reaches you (ledger write 4):
+
+> If you have a question, do not ask the user. Send it to me with
+> `hq send <your-name> "<question>"`, then stop and wait. My answer arrives
+> prefixed `[hq]`. End your final report with a line `session: ` followed by
+> the output of `echo $CLAUDE_CODE_SESSION_ID`.
+
+Put your own registered name in place of `<your-name>`. The examples below
+leave the closing text out to stay short.
+
 **No dependencies** — branch from the feature branch, never from `main`.
 Starting every chain on the feature branch is what lets step 7 land all the
 work there with a plain fast-forward:
@@ -258,8 +269,8 @@ Add `--kind <kind>` to pick a non-default agent kind, or `--permissive` to
 skip that worker's permission prompts entirely — only when the user has asked
 for an unattended run.
 
-**Ledger:** after each spawn, add the worker to the ledger (write 3), and end
-its `--task` with the sentence asking for its session id.
+**Ledger:** after each spawn, add the worker to the ledger (write 3). Check
+that its `--task` ends with the closing text above.
 
 ### 5. Several dependencies: merge them first, then spawn into the result
 
@@ -307,6 +318,29 @@ and never tell a worker to message "orchestrator" by that literal name.
 
 When a worker reports it is done, record its session id in the ledger
 (write 4 above).
+
+**Answer your workers' questions.** A worker sends its questions to you, not
+to the user (the closing text in step 4 tells it to). Answer from what you
+know: the bead and the epic, the spec, the code, the dependency graph, what
+other workers reported, and what the user already told you. Reply with
+`hq send <worker> "<answer>"`. If two workers could ask the same question,
+send the answer to both.
+
+Ask the user only when you are really unsure. That means:
+
+- The answer is a product or scope decision that the bead, the spec and the
+  user's earlier messages do not settle.
+- Two sources disagree, and you cannot tell which one is right.
+- The answer leads to an action that is hard to undo or that other people
+  see, for example a push, a deploy, a migration, or a message outside hq.
+
+When you ask the user, give the worker's name, its question, and what you
+would answer, so the user can reply with one word. Then relay the user's
+answer to the worker with `hq send`. Never guess on a question in this list
+to keep a worker moving.
+
+A worker's approval dialog (`blocked` in `hq ls`) is not a question. Only the
+user answers it (see Rules).
 
 Leave finished workers open — they are the record the user reviews, and each
 has its own sidebar entry. The user closes them when done, or asks you to
