@@ -101,6 +101,23 @@ defmodule Hq.Control.Handler do
     end
   end
 
+  # The daemon half of the CLI's `require_pane("spawn")`: a Claude session in
+  # a Herdr pane hq does not supervise resolves to "operator" (see
+  # `resolve_from/1`), and its workers would report to nobody. A person
+  # spawning by hand sends no `caller_is_agent` and is still allowed.
+  defp do_handle(%{
+         "verb" => "spawn",
+         "args" => %{"caller_is_agent" => true, "from" => "operator"}
+       }) do
+    {:error,
+     %{
+       "code" => "not_registered",
+       "message" =>
+         "this session is not registered with hq, so workers it spawns could not report to it\n" <>
+           "     Run `hq register <name>` in this session first, then spawn again."
+     }}
+  end
+
   defp do_handle(%{"verb" => "spawn", "args" => args}) do
     case Hq.Spawner.spawn_agent(args) do
       {:ok, %{"name" => name, "pane_id" => pane_id}} = ok ->

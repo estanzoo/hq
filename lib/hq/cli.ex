@@ -677,7 +677,34 @@ defmodule Hq.CLI do
     end
   end
 
+  # A person at a plain terminal may `hq spawn` by hand: the worker's parent
+  # is then "operator", and nobody expects it to report anywhere. A Claude
+  # session outside Herdr is different: it believes it is an orchestrator,
+  # but its workers could not `hq send` it anything, `hq cleanup` and the run
+  # record would never see them, and it improvises around that (workers
+  # writing result files it merges itself). Claude Code sets CLAUDECODE in
+  # every command it runs, which is what tells the two apart. The daemon
+  # refuses the in-pane-but-unregistered case (see the handler's `spawn`).
+  def require_pane("spawn") do
+    if agent_caller?() and System.get_env("HERDR_PANE_ID") == nil do
+      {:error,
+       %{
+         "code" => "no_pane",
+         "message" =>
+           "you are a Claude session outside a Herdr pane ($HERDR_PANE_ID is unset)\n" <>
+             "     Workers you spawn could not report to you, and hq could not clean them up.\n" <>
+             "     Stop and ask the user to open this session in Herdr and run " <>
+             "`hq register <name>`.\n" <>
+             "     Do not work around this, for example with result files you merge yourself."
+       }}
+    else
+      :ok
+    end
+  end
+
   def require_pane(_verb), do: :ok
+
+  defp agent_caller?, do: System.get_env("CLAUDECODE") not in [nil, ""]
 
   # The args-decoration pipeline `run_verb/1` applies before every request:
   # the caller's own identity comes from the pane it is running in. Public
@@ -686,7 +713,14 @@ defmodule Hq.CLI do
   # going through `main/1`, which calls `System.halt/1` and would kill the
   # test VM.
   @spec decorate(map()) :: map()
-  def decorate(args), do: args |> put_self("from") |> put_self_name()
+  def decorate(args), do: args |> put_self("from") |> put_self_name() |> put_caller_kind()
+
+  # Tells the daemon the request comes from a Claude session, so it can
+  # refuse a spawn whose parent it can only call "operator" (see
+  # `require_pane("spawn")` above).
+  defp put_caller_kind(args) do
+    if agent_caller?(), do: Map.put(args, "caller_is_agent", true), else: args
+  end
 
   defp put_self(args, key) do
     case System.get_env("HERDR_PANE_ID") do

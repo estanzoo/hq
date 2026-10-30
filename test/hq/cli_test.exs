@@ -504,6 +504,40 @@ defmodule Hq.CLITest do
       assert :ok = Hq.CLI.require_pane("inbox")
     end
 
+    test "spawn: a Claude session outside a Herdr pane is refused, daemon never contacted" do
+      System.delete_env("HERDR_PANE_ID")
+      System.put_env("CLAUDECODE", "1")
+      on_exit(fn -> System.delete_env("CLAUDECODE") end)
+      :ok = stop_supervised(Hq.Control)
+
+      assert {:error, %{"code" => "no_pane", "message" => message}} =
+               Hq.CLI.require_pane("spawn")
+
+      assert message =~ "outside a Herdr pane"
+      assert message =~ "could not report to you"
+      assert message =~ "hq register"
+    end
+
+    test "spawn: a Claude session inside a Herdr pane passes the client check" do
+      System.put_env("HERDR_PANE_ID", "w9:p1")
+      System.put_env("CLAUDECODE", "1")
+
+      on_exit(fn ->
+        System.delete_env("HERDR_PANE_ID")
+        System.delete_env("CLAUDECODE")
+      end)
+
+      assert :ok = Hq.CLI.require_pane("spawn")
+    end
+
+    test "decorate/1 marks a request from a Claude session, and only then" do
+      System.put_env("CLAUDECODE", "1")
+      assert Hq.CLI.decorate(%{})["caller_is_agent"] == true
+
+      System.delete_env("CLAUDECODE")
+      refute Map.has_key?(Hq.CLI.decorate(%{}), "caller_is_agent")
+    end
+
     test "other verbs are unaffected by a missing HERDR_PANE_ID" do
       System.delete_env("HERDR_PANE_ID")
 

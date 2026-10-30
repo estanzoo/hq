@@ -439,6 +439,10 @@ it goes idle. Tell peers what you have decided rather than waiting to be asked.
 
 ## Rules
 
+- Only a registered session in a Herdr pane spawns workers. Outside Herdr,
+  or before `hq register`, `hq spawn` refuses. Then stop and tell the user.
+  Never work around it, for example with workers that write result files
+  you merge yourself: their reports, cleanup and ledger entries would be lost.
 - Names must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents.
   Orchestrator = shortened epic name; worker = that name plus a task suffix.
 - `hq` never answers an approval dialog. If `hq ls` shows a worker `blocked`,

@@ -578,6 +578,58 @@ defmodule Hq.CleanupTest do
     assert Hq.Runs.all() == []
   end
 
+  # A person at a plain terminal spawning by hand is the "operator" case
+  # above. A Claude session hq cannot name is not: its workers would report to
+  # nobody, escape `hq cleanup`, and never reach the ledger.
+  test "a Claude session in an unregistered pane cannot spawn", %{fake: fake} do
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "root_pane" => %{"pane_id" => "w2:p1"}
+    })
+
+    assert {:error, %{"code" => "not_registered", "message" => message}} =
+             Hq.Control.Handler.handle(%{
+               "verb" => "spawn",
+               "args" => %{
+                 "name" => "stray-1",
+                 "from" => "w99:p1",
+                 "worktree" => false,
+                 "caller_is_agent" => true
+               }
+             })
+
+    assert message =~ "hq register"
+    refute Hq.Session.alive?("stray-1")
+    assert Hq.Runs.all() == []
+  end
+
+  test "a registered Claude session can spawn", %{fake: fake} do
+    FakeHerdr.stub(fake, "tab.create", %{
+      "type" => "tab_created",
+      "root_pane" => %{"pane_id" => "w2:p1"}
+    })
+
+    FakeHerdr.stub(fake, "pane.send_input", %{"type" => "pane_send_input"})
+    FakeHerdr.stub(fake, "agent.start", %{"type" => "agent_start"})
+
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "process_info" => %{"foreground_processes" => [%{"pid" => 9}], "shell_pid" => 9}
+    })
+
+    assert {:ok, %{"name" => "boss-2"}} =
+             Hq.Control.Handler.handle(%{
+               "verb" => "spawn",
+               "args" => %{
+                 "name" => "boss-2",
+                 "from" => @caller_pane,
+                 "worktree" => false,
+                 "caller_is_agent" => true
+               }
+             })
+
+    assert [%{"parent" => "boss", "name" => "boss-2"}] = Hq.Runs.all()
+  end
+
   # -- the real CLI pipeline ----------------------------------------------------------
 
   test "parse -> decorate -> request -> handler resolves the caller from $HERDR_PANE_ID",
