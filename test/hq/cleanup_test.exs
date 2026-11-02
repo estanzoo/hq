@@ -35,6 +35,13 @@ defmodule Hq.CleanupTest do
     FakeHerdr.stub(fake, "agent.rename", %{"type" => "agent_rename"})
     FakeHerdr.stub(fake, "pane.close", %{"type" => "pane_closed"})
 
+    # Real Herdr's answer for a pane that has been closed: a worker absent
+    # from agent.list has no pane left unless a test says otherwise.
+    FakeHerdr.stub_error(fake, "pane.process_info", %{
+      "code" => "pane_not_found",
+      "message" => "pane not found"
+    })
+
     start_supervised!({Registry, keys: :unique, name: Hq.Registry})
     start_supervised!(Hq.SessionSup)
     start_supervised!(Hq.Control)
@@ -343,6 +350,70 @@ defmodule Hq.CleanupTest do
     assert File.dir?(wt)
   end
 
+  # -- a worker whose Claude session has exited ----------------------------------
+
+  defp shell_pane!(fake, pane_id, cwd, extra \\ []) do
+    FakeHerdr.stub(fake, "pane.process_info", %{
+      "type" => "pane_process_info",
+      "process_info" => %{
+        "pane_id" => pane_id,
+        "shell_pid" => 9,
+        "foreground_processes" =>
+          [%{"pid" => 9, "name" => "zsh", "cwd" => cwd}] ++
+            Enum.map(extra, fn name -> %{"pid" => 10, "name" => name, "cwd" => cwd} end)
+      }
+    })
+  end
+
+  test "an exited worker's bare shell in its own worktree is closed", %{fake: fake, repo: repo} do
+    wt = worktree!(repo, "boss-1")
+    worker!("boss-1", "w2:p1", wt)
+    agents!(fake, [{"boss", @caller_pane, "idle"}])
+    shell_pane!(fake, "w2:p1", wt)
+
+    assert {:ok, dry} = cleanup(repo)
+    assert pane(dry, "boss-1")["action"] == "close"
+    assert closes(fake) == []
+
+    assert {:ok, result} = cleanup(repo, %{"yes" => true})
+
+    assert closes(fake) == [%{"pane_id" => "w2:p1"}]
+    assert pane(result, "boss-1")["action"] == "closed"
+    assert item(result, wt)["action"] == "removed"
+    assert Hq.Runs.for_parent("boss") == []
+  end
+
+  test "an exited worker's pane that runs something else is kept", %{fake: fake, repo: repo} do
+    wt = worktree!(repo, "boss-1")
+    worker!("boss-1", "w2:p1", wt)
+    agents!(fake, [{"boss", @caller_pane, "idle"}])
+    shell_pane!(fake, "w2:p1", wt, ["node"])
+
+    assert {:ok, result} = cleanup(repo, %{"yes" => true})
+
+    assert closes(fake) == []
+
+    assert pane(result, "boss-1") |> Map.take(["action", "reason"]) ==
+             %{"action" => "kept", "reason" => "pane runs node"}
+
+    assert item(result, wt)["action"] == "kept"
+    assert File.dir?(wt)
+  end
+
+  test "an exited worker's pane whose shell left its worktree is kept",
+       %{fake: fake, repo: repo, root: root} do
+    wt = worktree!(repo, "boss-1")
+    worker!("boss-1", "w2:p1", wt)
+    agents!(fake, [{"boss", @caller_pane, "idle"}])
+    shell_pane!(fake, "w2:p1", root)
+
+    assert {:ok, result} = cleanup(repo, %{"yes" => true})
+
+    assert closes(fake) == []
+    assert pane(result, "boss-1")["action"] == "kept"
+    assert pane(result, "boss-1")["reason"] =~ "not the worker's worktree"
+  end
+
   test "another orchestrator's workers are untouched", %{fake: fake, repo: repo} do
     wt_mine = worktree!(repo, "boss-1")
     wt_theirs = worktree!(repo, "other-1")
@@ -543,6 +614,12 @@ defmodule Hq.CleanupTest do
     start_supervised!({Registry, keys: :unique, name: Hq.Registry})
     start_supervised!(Hq.SessionSup)
     agents!(fake, [{"boss", @caller_pane, "idle"}])
+
+    FakeHerdr.stub_error(fake, "pane.process_info", %{
+      "code" => "pane_not_found",
+      "message" => "pane not found"
+    })
+
     start_supervised!(Hq.Roster)
     assert eventually(fn -> Hq.Session.alive?("boss") end)
     assert eventually(fn -> not Enum.any?(Hq.Roster.remembered(), &(&1["name"] == "boss-1")) end)

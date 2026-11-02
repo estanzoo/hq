@@ -15,6 +15,9 @@ defmodule Hq.Cleanup do
     * **Never the caller's own pane**, never a pane whose agent is not idle,
       and never a close Herdr says needs worktree-group confirmation — hq
       never forces one.
+    * **A worker whose session has exited** leaves a bare shell pane. It is
+      closed only when that shell is the pane's only process and is still
+      inside the worker's own worktree.
     * **Worktrees go only through plain `git worktree remove`** (never
       `--force`), and only when the worktree is linked (not the primary
       checkout), is not the caller's own, is clean, is not in `--keep`, is not
@@ -318,10 +321,75 @@ defmodule Hq.Cleanup do
         other = Enum.find(agents, &(&1["pane_id"] == recorded_pane))
         pane_entry(name, recorded_pane, "pane now hosts #{other["name"] || "another agent"}")
 
+      is_binary(recorded_pane) ->
+        agentless_pane_item(worker, caller, sessions, keep)
+
       true ->
         nil
     end
   end
+
+  # A worker whose Claude session has exited is no longer in `agent.list`,
+  # but its pane stays open as a bare shell and keeps its Herdr workspace in
+  # the sidebar. Close it only when it is plainly the worker's leftover: the
+  # shell is the pane's only foreground process, and that shell is still
+  # inside the worker's own worktree (Herdr reports the old path even after
+  # the directory is removed). Anything else -- a dev server, an editor, a
+  # shell somewhere else -- may be the user's, so the pane is kept.
+  defp agentless_pane_item(worker, caller, sessions, keep) do
+    name = worker["name"]
+    pane_id = worker["pane_id"]
+    holder = Enum.find(sessions, &(&1["pane_id"] == pane_id and &1["name"] != name))
+
+    case Hq.Herdr.call("pane.process_info", %{"pane_id" => pane_id}) do
+      {:error, %{"code" => "pane_not_found"}} ->
+        nil
+
+      {:ok, %{"process_info" => info}} when is_map(info) ->
+        reason =
+          cond do
+            pane_id == caller.pane_id -> "orchestrator's own pane"
+            holder -> "in use by #{holder["name"]}"
+            reason = foreign_process(info) -> reason
+            reason = foreign_cwd(info, worker["worktree"]) -> reason
+            keep.(name, worker["worktree"]) -> "--keep"
+            true -> nil
+          end
+
+        pane_entry(name, pane_id, reason)
+
+      {:error, %{"code" => code} = err} ->
+        pane_entry(name, pane_id, "could not read the pane: #{err["message"] || code}")
+
+      other ->
+        pane_entry(name, pane_id, "could not read the pane: #{inspect(other)}")
+    end
+  end
+
+  # The same structural match as `Hq.Spawner`'s ready check: exactly one
+  # foreground process, and it is the pane's own shell.
+  defp foreign_process(%{"foreground_processes" => [%{"pid" => pid}], "shell_pid" => pid}),
+    do: nil
+
+  defp foreign_process(%{"foreground_processes" => [_ | _] = procs, "shell_pid" => shell}) do
+    names =
+      for p <- procs, p["pid"] != shell, uniq: true, do: p["name"] || p["argv0"] || "a process"
+
+    "pane runs #{Enum.join(names, ", ")}"
+  end
+
+  defp foreign_process(_info), do: "pane's processes are unknown"
+
+  defp foreign_cwd(_info, nil), do: "no worktree to confirm the pane is the worker's"
+
+  defp foreign_cwd(%{"foreground_processes" => [%{"cwd" => cwd}]}, worktree)
+       when is_binary(cwd) do
+    if within?(canonical(cwd), canonical(worktree)),
+      do: nil,
+      else: "pane's shell is in #{cwd}, not the worker's worktree"
+  end
+
+  defp foreign_cwd(_info, _worktree), do: "pane's shell directory is unknown"
 
   defp pane_entry(name, pane_id, nil),
     do: %{"name" => name, "pane_id" => pane_id, "action" => "close", "reason" => nil}
