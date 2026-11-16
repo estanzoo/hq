@@ -12,8 +12,11 @@ defmodule Hq.SessionTest do
     Application.put_env(:hq, :herdr_socket, FakeHerdr.path(fake))
     Application.put_env(:hq, :root, root)
     Application.put_env(:hq, :settle_ms, 10)
+    # Long enough that no test sees a busy delivery unless it asks for one.
+    Application.put_env(:hq, :busy_delivery_ms, 60_000)
 
     on_exit(fn ->
+      Application.delete_env(:hq, :busy_delivery_ms)
       Application.put_env(:hq, :herdr_socket, prev_sock)
       Application.put_env(:hq, :root, prev_root)
       File.rm_rf(root)
@@ -66,6 +69,50 @@ defmodule Hq.SessionTest do
       assert prompts(fake) == []
       assert Hq.Session.info("worker-b")["mailbox"] == 1
     end
+  end
+
+  test "a worker still working after the busy wait gets its mail typed in", %{fake: fake} do
+    Application.put_env(:hq, :busy_delivery_ms, 30)
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "first")
+    Hq.Session.deliver("worker-b", "worker-c", "second")
+
+    assert eventually(fn -> length(prompts(fake)) == 1 end)
+    [%{"params" => params}] = prompts(fake)
+    assert params["text"] =~ "first"
+    assert params["text"] =~ "second"
+    assert Hq.Session.info("worker-b")["mailbox"] == 0
+
+    # One timer for the burst, not one per message.
+    Process.sleep(80)
+    assert length(prompts(fake)) == 1
+  end
+
+  test "a worker that turns blocked during the busy wait gets nothing typed in", %{fake: fake} do
+    Application.put_env(:hq, :busy_delivery_ms, 50)
+    stub_status(fake, "working")
+    start_session("working")
+
+    Hq.Session.deliver("worker-b", "worker-a", "held")
+    stub_status(fake, "blocked")
+    Process.sleep(120)
+
+    assert prompts(fake) == []
+    assert Hq.Session.info("worker-b")["mailbox"] == 1
+  end
+
+  test "an orchestrator is never typed into while it works", %{fake: fake} do
+    Application.put_env(:hq, :busy_delivery_ms, 20)
+    stub_status(fake, "working")
+    {:ok, _} = Hq.Session.start_link(name: "worker-b", pane_id: @pane)
+
+    Hq.Session.deliver("worker-b", "worker-a", "report")
+    Process.sleep(100)
+
+    assert prompts(fake) == []
+    assert Hq.Session.info("worker-b")["mailbox"] == 1
   end
 
   test "delivers held mail when the agent goes idle", %{fake: fake} do

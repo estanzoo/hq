@@ -7,7 +7,9 @@ description: Use when coordinating several Claude Code sessions as an orchestrat
 
 `hq` lets Claude Code sessions running in Herdr panes message each other.
 Messages are queued and typed into the target session's visible I/O when it
-next goes idle, so an arriving message is also the target's wakeup. `hq`
+next goes idle, so an arriving message is also the target's wakeup. A worker
+that is still working 20 seconds later gets the message anyway, after its
+current tool call. `hq`
 autostarts its own daemon on first use — you never start it by hand.
 
 `hq stop` and `hq restart` exist for the rare case the daemon itself needs to
@@ -434,8 +436,13 @@ hq ls        # who is live, their status, how much mail is queued
 hq inbox     # what is queued for you
 ```
 
-A message to a working agent is queued, not dropped, and delivered the moment
-it goes idle. Tell peers what you have decided rather than waiting to be asked.
+A message to a working agent is queued, not dropped. An orchestrator gets it
+when it goes idle. A worker gets it when it goes idle, or, if it is still
+working 20 seconds later, after its current tool call: Claude Code shows it as
+"The user sent a new message while you were working", followed by the `[hq]`
+message. Nothing is interrupted, so two busy workers can agree with each other
+without waiting for either turn to end. Tell peers what you have decided
+rather than waiting to be asked.
 
 ## Rules
 

@@ -89,12 +89,17 @@ defmodule Hq.Spawner do
 
     You can message any other live session directly:
       hq send <name> "<message>"   queue a message; it is typed into their
-                                   session the moment they go idle
+                                   session when they go idle, or after their
+                                   current tool call if they are still
+                                   working 20 seconds later
       hq ls                        who is live, their status and mailbox depth
       hq inbox                     what is queued for you
 
     Mail from a peer arrives prefixed `[hq]`. Anything without that prefix is
-    from your own operator. Peers are working in parallel, so tell them what you
+    from your own operator. Mail can arrive in the middle of your work, shown as
+    "The user sent a new message while you were working" followed by the `[hq]`
+    message: it is still a peer's mail, not your operator's. Finish the step you
+    are on, then act on it. Peers are working in parallel, so tell them what you
     have decided rather than waiting to be asked.
     """
   end

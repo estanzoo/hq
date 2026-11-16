@@ -3,13 +3,28 @@ defmodule Hq.Session do
   Supervises one Claude Code agent: its status, its mailbox, and delivery.
 
   Delivery types into an *idle* agent's I/O, which means an arriving message is
-  also the agent's wakeup. That is the whole loop — nothing polls, and no timer
-  drives it. Only `pane.agent_status_changed` events pushed by Herdr do.
+  also the agent's wakeup. That is the whole loop — nothing polls. Only
+  `pane.agent_status_changed` events pushed by Herdr drive it, with one
+  exception: a worker that is still working after `busy_delivery_ms` gets its
+  mail anyway (see `maybe_schedule_busy/1`).
   """
   use GenServer
   require Logger
 
   @ready ~w(idle done)
+
+  # A worker's turn can run for most of an hour (a Gradle gate, a rebase), so
+  # two workers that wait on each other's answers waited that long too: each
+  # message sat until its receiver went idle. Claude Code queues a prompt
+  # typed into a working session and gives it to the model after the current
+  # tool call ends, as "The user sent a new message while you were working".
+  # Nothing is interrupted. So a worker still working after this wait gets its
+  # mail typed in. The wait lets a turn that is about to end take the mail the
+  # usual way, and batches a burst of messages into one prompt.
+  #
+  # Only workers (sessions with a `spawned_by`): a registered orchestrator is
+  # where the user types, and text typed into a draft would be sent with it.
+  @busy_delivery_ms 20_000
 
   # A settle-triggered flush can occupy the Session process for up to the
   # bounded `agent.prompt` call in `flush/1` (10s). This gives a queued
@@ -26,7 +41,8 @@ defmodule Hq.Session do
     :mailbox,
     status: "unknown",
     settling: false,
-    notified_blocked: false
+    notified_blocked: false,
+    busy_timer: nil
   ]
 
   # -- API ------------------------------------------------------------------
@@ -122,7 +138,20 @@ defmodule Hq.Session do
 
   def handle_info(:settled, state) do
     state = %{state | settling: false} |> refresh_status()
-    {:noreply, flush(state)}
+    {:noreply, state |> flush() |> maybe_schedule_busy()}
+  end
+
+  # Re-read the status first, as `:settled` does: a worker that went idle or
+  # blocked during the wait is not typed into here. Idle goes the usual way;
+  # blocked waits for a person. A failed delivery is not retried from here
+  # (a retry timer would loop on a lasting failure); the next status change
+  # or message tries again.
+  def handle_info(:busy_due, state) do
+    state = %{state | busy_timer: nil} |> refresh_status()
+
+    if busy_ready?(state),
+      do: {:noreply, prompt(state)},
+      else: {:noreply, maybe_flush(state)}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -141,11 +170,25 @@ defmodule Hq.Session do
       Process.send_after(self(), :settled, settle_ms())
       %{state | settling: true}
     else
-      state
+      maybe_schedule_busy(state)
     end
   end
 
   defp settle_ms, do: Application.get_env(:hq, :settle_ms, 400)
+
+  # At most one timer at a time: mail that arrives during the wait goes with
+  # it, not on a timer of its own.
+  defp maybe_schedule_busy(%{busy_timer: nil} = state) do
+    if busy_ready?(state) do
+      %{state | busy_timer: Process.send_after(self(), :busy_due, busy_delivery_ms())}
+    else
+      state
+    end
+  end
+
+  defp maybe_schedule_busy(state), do: state
+
+  defp busy_delivery_ms, do: Application.get_env(:hq, :busy_delivery_ms, @busy_delivery_ms)
 
   # hq never answers an approval dialog — a worker asking to do something
   # unexpected is a human decision. It does make sure someone is told, once,
@@ -167,37 +210,40 @@ defmodule Hq.Session do
 
   defp put_status(state, status), do: %{state | status: status, notified_blocked: false}
 
-  defp flush(state) do
-    if ready?(state) do
-      msgs = Hq.Mailbox.peek(state.mailbox)
-      text = Hq.Envelope.render(msgs)
+  defp flush(state), do: if(ready?(state), do: prompt(state), else: state)
 
-      # No `wait`: the Session learns the outcome from status events instead of
-      # blocking its own mailbox on the call. Bounded well under the 30s
-      # Herdr client default: a prompt is a local unix-socket write, so 10s
-      # is already far beyond any healthy case, and it caps how long this
-      # process can be occupied against a concurrent caller's patience above.
-      case Hq.Herdr.call("agent.prompt", %{"target" => state.name, "text" => text},
-             timeout: 10_000
-           ) do
-        {:ok, _} ->
-          # Only drain (and persist the truncation) once delivery has actually
-          # succeeded — draining first would durably erase mail the agent
-          # never received.
-          {_delivered, mailbox} = Hq.Mailbox.drain(state.mailbox)
-          %{state | mailbox: mailbox}
+  # Herdr's `agent.prompt` refuses a blocked agent before it sends any input,
+  # so a dialog that opens after the status was read is never answered here.
+  defp prompt(state) do
+    msgs = Hq.Mailbox.peek(state.mailbox)
+    text = Hq.Envelope.render(msgs)
 
-        {:error, reason} ->
-          Logger.warning("hq: delivery to #{state.name} failed: #{inspect(reason)}")
-          # Nothing drained, nothing persisted — retried on the next ready transition.
-          state
-      end
-    else
-      state
+    # No `wait`: the Session learns the outcome from status events instead of
+    # blocking its own mailbox on the call. Bounded well under the 30s
+    # Herdr client default: a prompt is a local unix-socket write, so 10s
+    # is already far beyond any healthy case, and it caps how long this
+    # process can be occupied against a concurrent caller's patience above.
+    case Hq.Herdr.call("agent.prompt", %{"target" => state.name, "text" => text}, timeout: 10_000) do
+      {:ok, _} ->
+        # Only drain (and persist the truncation) once delivery has actually
+        # succeeded — draining first would durably erase mail the agent
+        # never received.
+        {_delivered, mailbox} = Hq.Mailbox.drain(state.mailbox)
+        %{state | mailbox: mailbox}
+
+      {:error, reason} ->
+        Logger.warning("hq: delivery to #{state.name} failed: #{inspect(reason)}")
+        # Nothing drained, nothing persisted — retried on the next ready transition.
+        state
     end
   end
 
   defp ready?(state), do: state.status in @ready and Hq.Mailbox.depth(state.mailbox) > 0
+
+  defp busy_ready?(state) do
+    state.spawned_by != nil and state.status == "working" and
+      Hq.Mailbox.depth(state.mailbox) > 0
+  end
 
   # A refresh is a re-read of existing state, not a transition, so it must
   # never notify — that stays put_status/2's job. But it must not leave a

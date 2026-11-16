@@ -89,6 +89,10 @@ answers one request per connection and serves only events once subscribed, so
 per-agent connections are what the protocol requires, not a stylistic choice.
 
 Delivery targets an *idle* agent, which means a message is also the wakeup:
-agent works → idles → mail lands → works again. Nothing polls.
+agent works → idles → mail lands → works again. Nothing polls. One exception:
+a worker (a session hq spawned) that is still working 20 seconds after mail
+arrives gets it typed in anyway. Claude Code queues it and gives it to the
+model after the current tool call, so nothing is interrupted. A registered
+orchestrator is never typed into while it works: the user types there.
 
 Design notes: `docs/superpowers/specs/2026-09-21-hq-design.md`
