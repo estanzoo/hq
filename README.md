@@ -14,7 +14,44 @@ Requires a running Herdr server and Elixir 1.18+. The installer builds the
 escript, symlinks `hq` onto `$HOME/.local/bin` and `skills/hq` onto
 `~/.claude/skills/hq`, and prints the permission allowlist entry to add to
 `~/.claude/settings.json` so peer messaging never stalls on an approval
-dialog.
+dialog. It also prints the optional settings for the sidebar (below).
+
+## Sidebar
+
+Herdr's agent sidebar can show, for each Claude Code session, how full its
+context is and what it is doing:
+
+```
+● worker-a
+  ▰▰▰▰▱ 70% · ⏳ 4m · worker-a     script wait: a Bash command has run for 4 minutes
+● worker-b
+  ▰▱▱▱▱ 12% · 📝 9m · worker-b     coding time: the current turn has run for 9 minutes
+● worker-c
+  ▰▱▱▱▱ 29% · worker-c             idle
+```
+
+- `sidebar/statusline.sh` is a Claude Code status line. It reports the
+  context bar to Herdr as the `ctx` token.
+- `sidebar/activity.sh` runs from Claude Code hooks and reports the
+  `activity` token:
+  - ⏳ while a Bash command runs, once it has run for 15 seconds, so quick
+    commands do not flash. It also shows while the session is idle and waits
+    for a background shell (`run_in_background`), with that shell's run time.
+  - 📝 while a turn runs and no long command does.
+
+The hooks only write, rename or delete small files in `~/.hq/activity` and
+return at once (about 40 ms on a heavily loaded machine); they never call
+Herdr. The files are kept per session, so a `claude` started inside a pane
+cannot end the records of the session around it. One loop for each pane sets
+the token when its text changes and ends when nothing is left. If a Stop hook
+is missed, the loop ends the turn when Herdr reports the pane idle twice in a
+row; a background shell ends with its session, or when the pane has no agent.
+Outside a Herdr pane the scripts do nothing. Both need `jq`.
+
+`./install.sh` prints the `statusLine` and `hooks` settings for
+`~/.claude/settings.json` and the row for `~/.config/herdr/config.toml`.
+Running sessions pick up the hooks too. A session that is in a turn when the
+hooks arrive shows its coding time from its next turn.
 
 ## Use
 

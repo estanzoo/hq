@@ -32,6 +32,35 @@ cat <<'JSON'
   { "permissions": { "allow": ["Bash(hq:*)"] } }
 JSON
 echo
+echo "Optional: Herdr's agent sidebar can show each session's context use and"
+echo "activity (⏳ script wait, 📝 coding time). See README, \"Sidebar\". Needs jq."
+echo "In ~/.claude/settings.json (merge \"hooks\" with any hooks you have):"
+echo
+a="$repo/sidebar/activity.sh"
+hook="[{ \"type\": \"command\", \"command\": \"$a\", \"timeout\": 5 }]"
+cat <<JSON
+  {
+    "statusLine": { "type": "command", "command": "$repo/sidebar/statusline.sh" },
+    "hooks": {
+      "UserPromptSubmit":   [{ "hooks": $hook }],
+      "PreToolUse":         [{ "matcher": "Bash", "hooks": $hook }],
+      "PostToolUse":        [{ "matcher": "Bash", "hooks": $hook }],
+      "PostToolUseFailure": [{ "matcher": "Bash", "hooks": $hook }],
+      "PostToolBatch":      [{ "hooks": [{ "type": "command", "command": "$a", "timeout": 5, "async": true }] }],
+      "Stop":               [{ "hooks": $hook }],
+      "StopFailure":        [{ "hooks": $hook }],
+      "SessionEnd":         [{ "hooks": $hook }]
+    }
+  }
+JSON
+echo
+echo "In ~/.config/herdr/config.toml, then run 'herdr server reload-config':"
+echo
+cat <<'TOML'
+  [ui.sidebar.agents]
+  rows = [["state_icon", "machine", "workspace", "tab"], [{ token = "$ctx", dim = true }, { token = "$activity" }, "agent"]]
+TOML
+echo
 echo "hq needs a running Herdr server. Start one with 'herdr' in a terminal."
 echo
 echo "If a daemon from a previous build is still running, it will keep serving"
