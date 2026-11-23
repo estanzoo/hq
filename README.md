@@ -10,8 +10,9 @@ the target's visible I/O when it next goes idle.
 ./install.sh
 ```
 
-Requires a running Herdr server and Elixir 1.18+. The installer builds the
-escript, symlinks `hq` onto `$HOME/.local/bin` and `skills/hq` onto
+Requires a running Herdr server and Elixir 1.18+. The installer installs Elixir
+and Herdr with Homebrew if they are missing (Herdr falls back to its own
+installer where Homebrew is not available), builds the escript, symlinks `hq` onto `$HOME/.local/bin` and `skills/hq` onto
 `~/.claude/skills/hq`, and prints the permission allowlist entry to add to
 `~/.claude/settings.json` so peer messaging never stalls on an approval
 dialog. It also prints the optional settings for the sidebar (below).

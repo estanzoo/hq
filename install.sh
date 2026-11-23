@@ -11,6 +11,19 @@ command -v elixir >/dev/null 2>&1 || {
   brew install elixir
 }
 
+# Herdr's own installer is the fallback where Homebrew is not available.
+command -v herdr >/dev/null 2>&1 || {
+  echo "installing herdr..."
+  if command -v brew >/dev/null 2>&1; then
+    brew install herdr
+  else
+    curl -fsSL https://herdr.dev/install.sh | sh
+  fi
+  command -v herdr >/dev/null 2>&1 || {
+    echo "herdr is installed but not on your PATH; open a new terminal or add its folder to PATH." >&2
+  }
+}
+
 echo "building hq..."
 cd "$repo"
 mix deps.get >/dev/null 2>&1 || true
