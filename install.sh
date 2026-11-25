@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # install.sh — build hq and wire it into the local environment.
+#   ./install.sh               also sets up the sidebar (README, "Sidebar")
+#   ./install.sh --no-sidebar  leaves Claude Code's and Herdr's config alone
 set -euo pipefail
+
+sidebar=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-sidebar) sidebar=0 ;;
+    *) echo "usage: ./install.sh [--no-sidebar]" >&2; exit 2 ;;
+  esac
+done
 
 repo="$(cd "$(dirname "$0")" && pwd)"
 bindir="${HQ_BINDIR:-$HOME/.local/bin}"
@@ -24,6 +34,13 @@ command -v herdr >/dev/null 2>&1 || {
   }
 }
 
+# The sidebar's scripts read JSON with jq. Without Homebrew, setup.sh says
+# how to finish once jq is installed.
+if [ "$sidebar" = 1 ] && ! command -v jq >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+  echo "installing jq..."
+  brew install jq
+fi
+
 echo "building hq..."
 cd "$repo"
 mix deps.get >/dev/null 2>&1 || true
@@ -45,34 +62,13 @@ cat <<'JSON'
   { "permissions": { "allow": ["Bash(hq:*)"] } }
 JSON
 echo
-echo "Optional: Herdr's agent sidebar can show each session's context use and"
-echo "activity (⏳ script wait, 📝 coding time). See README, \"Sidebar\". Needs jq."
-echo "In ~/.claude/settings.json (merge \"hooks\" with any hooks you have):"
-echo
-a="$repo/sidebar/activity.sh"
-hook="[{ \"type\": \"command\", \"command\": \"$a\", \"timeout\": 5 }]"
-cat <<JSON
-  {
-    "statusLine": { "type": "command", "command": "$repo/sidebar/statusline.sh" },
-    "hooks": {
-      "UserPromptSubmit":   [{ "hooks": $hook }],
-      "PreToolUse":         [{ "matcher": "Bash", "hooks": $hook }],
-      "PostToolUse":        [{ "matcher": "Bash", "hooks": $hook }],
-      "PostToolUseFailure": [{ "matcher": "Bash", "hooks": $hook }],
-      "PostToolBatch":      [{ "hooks": [{ "type": "command", "command": "$a", "timeout": 5, "async": true }] }],
-      "Stop":               [{ "hooks": $hook }],
-      "StopFailure":        [{ "hooks": $hook }],
-      "SessionEnd":         [{ "hooks": $hook }]
-    }
-  }
-JSON
-echo
-echo "In ~/.config/herdr/config.toml, then run 'herdr server reload-config':"
-echo
-cat <<'TOML'
-  [ui.sidebar.agents]
-  rows = [["state_icon", "machine", "workspace", "tab"], [{ token = "$ctx", dim = true }, { token = "$activity" }, "agent"]]
-TOML
+if [ "$sidebar" = 1 ]; then
+  # Context use and activity of each agent in Herdr's sidebar (README,
+  # "Sidebar"). Changes only what it needs, and backs up each file it changes.
+  "$repo/sidebar/setup.sh" || echo "sidebar: set-up failed; hq itself is installed. Run $repo/sidebar/setup.sh again to retry." >&2
+else
+  echo "sidebar: skipped (--no-sidebar). Run $repo/sidebar/setup.sh to set it up later."
+fi
 echo
 echo "hq needs a running Herdr server. Start one with 'herdr' in a terminal."
 echo

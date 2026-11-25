@@ -12,10 +12,11 @@ the target's visible I/O when it next goes idle.
 
 Requires a running Herdr server and Elixir 1.18+. The installer installs Elixir
 and Herdr with Homebrew if they are missing (Herdr falls back to its own
-installer where Homebrew is not available), builds the escript, symlinks `hq` onto `$HOME/.local/bin` and `skills/hq` onto
-`~/.claude/skills/hq`, and prints the permission allowlist entry to add to
-`~/.claude/settings.json` so peer messaging never stalls on an approval
-dialog. It also prints the optional settings for the sidebar (below).
+installer where Homebrew is not available), builds the escript, symlinks `hq`
+onto `$HOME/.local/bin` and `skills/hq` onto `~/.claude/skills/hq`, and prints
+the permission allowlist entry to add to `~/.claude/settings.json` so peer
+messaging never stalls on an approval dialog. It also sets up the sidebar
+(below); `./install.sh --no-sidebar` skips that.
 
 ## Sidebar
 
@@ -49,8 +50,19 @@ is missed, the loop ends the turn when Herdr reports the pane idle twice in a
 row; a background shell ends with its session, or when the pane has no agent.
 Outside a Herdr pane the scripts do nothing. Both need `jq`.
 
-`./install.sh` prints the `statusLine` and `hooks` settings for
-`~/.claude/settings.json` and the row for `~/.config/herdr/config.toml`.
+`./install.sh` sets the sidebar up with `sidebar/setup.sh`, which is safe to
+run again:
+
+- In `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`), it sets the
+  `statusLine` and adds the hooks. Other settings and hooks are kept, and a
+  hook from another checkout of hq is replaced. A `statusLine` of your own is
+  kept, with a note; the context bar then does not show.
+- In Herdr's config file, it adds the `[ui.sidebar.agents]` rows if the file
+  has none, and reloads Herdr. Rows of your own are kept, with a note that
+  shows the row to add. If `herdr config check` rejects the result, the file
+  is put back.
+- It backs up each file it changes as `<file>.bak-hq-<time>`.
+
 Running sessions pick up the hooks too. A session that is in a turn when the
 hooks arrive shows its coding time from its next turn.
 
